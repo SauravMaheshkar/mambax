@@ -6,8 +6,24 @@ readme = ".github/README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 dependencies = [
+    "clu>=0.0.12",
+    "datasets>=3.6.0",
+    "einops>=0.8.1",
+    "flax>=0.10.6",
+    "huggingface-hub>=0.33.0",
+    "jaxtyping>=0.3.2",
+    "ml-collections>=1.1.0",
+    "safetensors>=0.5.3",
+    "transformers>=4.52.4",
+]
+
+[dependency-groups]
+dev = [
     "pytest>=6.0.0",
-    "ruff",
+    "ruff>=0.12.0",
+]
+wandb = [
+    "wandb>=0.20.1",
 ]
 
 [tool.ruff]
@@ -25,3 +41,4 @@ filterwarnings = [
     "ignore::DeprecationWarning",
 	"ignore::UserWarning"
 ]
+
