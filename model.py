@@ -362,3 +362,68 @@ class Mamba(nnx.Module):
         state = checkpointer.restore(f"{path}/mamba", item=nnx.state(self))
         nnx.update(self, state)
         return self
+
+    def generate_step(self, carry, params):
+        _, key, generated_tokens = carry
+        sample = params["sample"]
+        top_k = params["top_k"]
+        prompt = params["prompt"]
+
+        full_input = (
+            jnp.concatenate([prompt, generated_tokens], axis=1)
+            if generated_tokens.shape[1] > 0
+            else prompt
+        )
+
+        next_token_logits = self(full_input)[:, -1]
+        logits = next_token_logits
+
+        if top_k is not None:
+            values, _ = jax.lax.top_k(logits, k=top_k)
+            logits = jnp.where(logits < values[:, -1, None], -jnp.inf, logits)
+
+        if sample:
+            key, subkey = jax.random.split(key)
+            next_indices = jax.random.categorical(subkey, logits, axis=-1)[:, None]
+        else:
+            next_indices = jax.numpy.argmax(logits, axis=-1)[:, None]
+
+        # Append the new token to generated_tokens
+        generated_tokens = jnp.concatenate([generated_tokens, next_indices], axis=1)
+        return (next_indices, key, generated_tokens), next_indices
+
+    def generate(
+        self,
+        tokenizer,
+        prompt: str,
+        n_tokens_to_gen: int = 50,
+        sample: bool = True,
+        top_k: int = 40,
+    ):
+        self.eval()
+
+        input_ids = tokenizer(prompt, return_tensors="jax")["input_ids"]
+        key = jax.random.PRNGKey(0)
+        batch_size = input_ids.shape[0]
+
+        generated_tokens = jnp.zeros((batch_size, n_tokens_to_gen), dtype=input_ids.dtype)
+        last_token = input_ids[:, -1:]
+        initial_pos = 0
+
+        def scan_step(carry, _):
+            last_token, key, generated_tokens, pos = carry
+            (next_indices, key, _), next_indices = self.generate_step(
+                (last_token, key, jnp.zeros((batch_size, 0), dtype=input_ids.dtype)),
+                {"sample": sample, "top_k": top_k, "prompt": input_ids},
+            )
+            generated_tokens = generated_tokens.at[:, pos].set(next_indices.squeeze(-1))
+            return (next_indices, key, generated_tokens, pos + 1), next_indices
+
+        (last_token, key, generated_tokens, _), _ = jax.lax.scan(
+            scan_step,
+            (last_token, key, generated_tokens, initial_pos),
+            None,
+            length=n_tokens_to_gen,
+        )
+        full_sequence = jnp.concatenate([input_ids, generated_tokens], axis=1)
+        return [tokenizer.decode(output.tolist()) for output in full_sequence][0]
