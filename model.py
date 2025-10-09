@@ -186,6 +186,8 @@ class ResidualBlock(nnx.Module):
 
 
 class Mamba(nnx.Module):
+    layers: nnx.Data[list]
+
     def __init__(
         self,
         *,
