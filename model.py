@@ -4,7 +4,6 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 import jaxtyping
-import orbax.checkpoint as ocp
 from einops import einsum, repeat
 from flax import nnx
 from huggingface_hub import hf_hub_download
@@ -218,19 +217,21 @@ class Mamba(nnx.Module):
             rngs=rngs,
         )
 
-        self.layers = [
-            ResidualBlock(
-                model_dim=model_dim,
-                hidden_dim=hidden_dim,
-                conv_dim=conv_dim,
-                dt_rank=dt_rank,
-                state_dim=state_dim,
-                use_bias=use_bias,
-                conv_bias=conv_bias,
-                rngs=rngs,
-            )
-            for _ in range(self.num_layers)
-        ]
+        self.layers = nnx.List(
+            [
+                ResidualBlock(
+                    model_dim=model_dim,
+                    hidden_dim=hidden_dim,
+                    conv_dim=conv_dim,
+                    dt_rank=dt_rank,
+                    state_dim=state_dim,
+                    use_bias=use_bias,
+                    conv_bias=conv_bias,
+                    rngs=rngs,
+                )
+                for _ in range(self.num_layers)
+            ]
+        )
 
         self.norm_f = nnx.RMSNorm(num_features=model_dim, rngs=rngs)
 
@@ -274,6 +275,7 @@ class Mamba(nnx.Module):
         Args:
             path: The directory path to save the model state to.
         """
+        import orbax.checkpoint as ocp
         state = nnx.state(self)
         checkpointer = ocp.PyTreeCheckpointer()
         checkpointer.save(f"{path}/mamba", state, **kwargs)
@@ -358,6 +360,7 @@ class Mamba(nnx.Module):
         Args:
             path: The directory path to load the model state from.
         """
+        import orbax.checkpoint as ocp
         checkpointer = ocp.PyTreeCheckpointer()
         state = checkpointer.restore(f"{path}/mamba", item=nnx.state(self))
         nnx.update(self, state)
