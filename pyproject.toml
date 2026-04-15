@@ -7,7 +7,7 @@ requires-python = ">=3.11"
 license = { file = "LICENSE" }
 dependencies = [
     "clu>=0.0.12",
-    "datasets>=3.6.0",
+    "datasets>=4.8.4",
     "einops>=0.8.1",
     "flax>=0.12.6",
     "huggingface-hub>=1.10.2",
