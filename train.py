@@ -13,7 +13,7 @@ from model import Mamba
 
 def loss_fn(
     model: nnx.Module, batch: tuple[jax.Array, jax.Array]
-) -> tuple[float, jax.Array]:
+) -> tuple[jax.Array, jax.Array]:
     logits = model(batch[0])
     loss = optax.softmax_cross_entropy_with_integer_labels(
         logits=logits, labels=batch[1]
@@ -49,12 +49,7 @@ def train_and_evaluate(config: default.Config, workdir: str) -> None:
 
     train_data, _, vocab_size = get_datasets()
 
-    config.vocab_size = vocab_size
-    if config.vocab_size % config.pad_vocab_size_multiple != 0:
-        config.vocab_size += (
-            config.pad_vocab_size_multiple
-            - config.vocab_size % config.pad_vocab_size_multiple
-        )
+    config = dataclasses.replace(config, vocab_size=vocab_size)
 
     dynamic_slice_vmap = jax.vmap(jax.lax.dynamic_slice, in_axes=(None, 0, None))
 

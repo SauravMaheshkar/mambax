@@ -4,14 +4,12 @@ import jax
 import jax.numpy as jnp
 from einops import einsum, repeat
 from flax import nnx
+from flax.typing import PathParts
 from huggingface_hub import hf_hub_download
 from jaxtyping import Array, Float, Int
 from safetensors import safe_open
 
 from configs.default import Config
-
-
-ParamPath = tuple[str | int, ...]
 
 
 def dt_kernel_init(dt_rank: int) -> nnx.Initializer:
@@ -279,11 +277,11 @@ class Mamba(nnx.Module):
     @classmethod
     def from_config(cls, config: Config, *, rngs: nnx.Rngs) -> "Mamba":
         return cls(
-            vocab_size=config.vocab_size,
+            vocab_size=config.padded_vocab_size,
             model_dim=config.model_dim,
             hidden_dim=config.hidden_dim,
             conv_dim=config.conv_dim,
-            dt_rank=config.dt_rank,
+            dt_rank=config.resolved_dt_rank,
             state_dim=config.state_dim,
             num_layers=config.num_layers,
             use_bias=config.use_bias,
@@ -404,7 +402,7 @@ class Mamba(nnx.Module):
         return self
 
 
-def _hf_to_nnx(key: str, tensor: Array) -> tuple[ParamPath, Array]:
+def _hf_to_nnx(key: str, tensor: Array) -> tuple[PathParts, Array]:
     """Maps a `transformers` Mamba tensor to its NNX parameter path and layout.
 
     torch Linear stores (out, in) and depthwise Conv1d stores (out, 1, kernel),
