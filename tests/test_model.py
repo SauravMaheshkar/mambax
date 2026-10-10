@@ -36,21 +36,76 @@ def sequential_scan(u, delta, A, B, C, D) -> np.ndarray:
     return np.stack(ys, axis=1)
 
 
-@pytest.mark.parametrize("seq_len", [1, 2, 7, 64])
-def test_selective_scan_matches_sequential_reference(seq_len: int):
-    batch, hidden, state = 2, 8, 4
-    keys = jax.random.split(jax.random.key(seq_len), 6)
-    u = jax.random.normal(keys[0], (batch, seq_len, hidden))
-    delta = jax.nn.softplus(jax.random.normal(keys[1], (batch, seq_len, hidden)))
-    A = -jnp.exp(jax.random.normal(keys[2], (hidden, state)))
-    B = jax.random.normal(keys[3], (batch, seq_len, state))
-    C = jax.random.normal(keys[4], (batch, seq_len, state))
-    D = jax.random.normal(keys[5], (hidden,))
+def scan_inputs(batch: int, seq_len: int, hidden: int, state: int, seed: int = 0):
+    keys = jax.random.split(jax.random.key(seed), 6)
+    return (
+        jax.random.normal(keys[0], (batch, seq_len, hidden)),
+        jax.nn.softplus(jax.random.normal(keys[1], (batch, seq_len, hidden))),
+        -jnp.exp(jax.random.normal(keys[2], (hidden, state))),
+        jax.random.normal(keys[3], (batch, seq_len, state)),
+        jax.random.normal(keys[4], (batch, seq_len, state)),
+        jax.random.normal(keys[5], (hidden,)),
+    )
 
-    actual = MambaBlock.selective_scan(u, delta, A, B, C, D)
-    expected = sequential_scan(*map(np.asarray, (u, delta, A, B, C, D)))
+
+@pytest.mark.parametrize(
+    ("seq_len", "chunk_size"),
+    [(1, 1), (1, 32), (2, 1), (7, 3), (64, 1), (64, 7), (64, 32), (64, 64), (64, 100)],
+)
+def test_selective_scan_matches_sequential_reference(seq_len: int, chunk_size: int):
+    inputs = scan_inputs(batch=2, seq_len=seq_len, hidden=8, state=4, seed=seq_len)
+
+    actual = MambaBlock.selective_scan(*inputs, chunk_size=chunk_size)
+    expected = sequential_scan(*map(np.asarray, inputs))
 
     np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("chunk_size", [1, 5, 16])
+def test_chunked_scan_gradients_match_single_chunk(chunk_size: int):
+    """The carried state and per-chunk recomputation must be invisible to autodiff."""
+    inputs = scan_inputs(batch=2, seq_len=48, hidden=8, state=4)
+
+    def loss(chunk: int):
+        return lambda *args: jnp.sum(
+            MambaBlock.selective_scan(*args, chunk_size=chunk) ** 2
+        )
+
+    argnums = tuple(range(len(inputs)))
+    expected = jax.grad(loss(48), argnums=argnums)(*inputs)
+    actual = jax.grad(loss(chunk_size), argnums=argnums)(*inputs)
+
+    for a, e in zip(actual, expected):
+        np.testing.assert_allclose(a, e, rtol=1e-4, atol=1e-5)
+
+
+def scan_backward_temp_bytes(seq_len: int, batch: int, hidden: int, state: int) -> int:
+    inputs = scan_inputs(batch, seq_len, hidden, state)
+
+    def loss(*args):
+        return jnp.sum(MambaBlock.selective_scan(*args, chunk_size=32))
+
+    grad = jax.jit(jax.grad(loss, argnums=tuple(range(len(inputs)))))
+    memory = grad.lower(*inputs).compile().memory_analysis()
+    assert memory is not None
+    return memory.temp_size_in_bytes
+
+
+def test_scan_backward_memory_does_not_scale_with_state_sequence():
+    """Regression guard for the chunked scan, from XLA's compiled memory plan.
+
+    A whole-sequence scan keeps ~11 (batch, seq, hidden, state) tensors alive in
+    the backward pass (706MB at seq 4096 here) and grows 4x when seq grows 4x.
+    Chunked, only (batch, seq, hidden)-sized inputs and gradients grow with seq.
+    """
+    batch, hidden, state = 4, 64, 16
+    one_state_sequence = batch * 4096 * hidden * state * 4
+
+    short = scan_backward_temp_bytes(1024, batch, hidden, state)
+    long = scan_backward_temp_bytes(4096, batch, hidden, state)
+
+    assert long < 0.5 * one_state_sequence
+    assert long < 3 * short
 
 
 @pytest.mark.parametrize("position", [0, 5, 31])
