@@ -39,6 +39,8 @@ class Config:
     use_bias: bool = False
     # convolution bias
     conv_bias: bool = True
+    # RMSNorm epsilon
+    norm_eps: float = 1e-5
     # whether to use weights and biases
     use_wandb: bool = False
     # weights and biases project
