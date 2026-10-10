@@ -13,16 +13,21 @@ class Config:
     num_layers: int = 4
     # batch size for training
     batch_size: int = 16
-    # number of epochs for training
-    num_epochs: int = 1
     # learning rate
     learning_rate: float = 1e-3
     # random seed
     seed: int = 42
     # number of iterations
     n_iterations: int = 10_000
-    # frequency of updating metrics
+    # frequency of logging the train loss
     n_freq_train: int = 100
+    # frequency of evaluating the val loss
+    n_freq_eval: int = 1000
+    # number of batches per val loss evaluation
+    n_eval_batches: int = 20
+    # TinyStories splits, `datasets` slicing like "train[:10%]" works
+    train_split: str = "train"
+    eval_split: str = "validation"
     # sequence length for training
     sequence_length: int = 64
     # convolution dimension

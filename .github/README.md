@@ -6,8 +6,19 @@ uv sync --all-groups
 
 ## Getting started
 
+Trains a character-level Mamba on [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories),
+logging train loss and validation loss.
+
 ```shell
 python main.py --workdir=artifacts/
+```
+
+Any field in `configs/default.py` can be overridden, e.g. a quick run on 10% of the data
+
+```shell
+python main.py --workdir=artifacts/ \
+    --config.train_split="train[:10%]" \
+    --config.sequence_length=256
 ```
 
 Log training logs to wandb
