@@ -71,18 +71,7 @@ def train_and_evaluate(config: default.Config, workdir: str) -> None:
 
     get_batch = jax.jit(get_batch_fn, static_argnames=["batch_size", "sequence_length"])
 
-    model = Mamba(
-        vocab_size=config.vocab_size,
-        model_dim=config.model_dim,
-        hidden_dim=config.hidden_dim,
-        conv_dim=config.conv_dim,
-        dt_rank=config.dt_rank,
-        state_dim=config.state_dim,
-        num_layers=config.num_layers,
-        use_bias=config.use_bias,
-        conv_bias=config.conv_bias,
-        rngs=nnx.Rngs(0),
-    )
+    model = Mamba.from_config(config, rngs=nnx.Rngs(0))
 
     logging.info(f"Total number of parameters: {model.num_params:_}")
     if config.use_wandb:

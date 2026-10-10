@@ -26,7 +26,7 @@ class Config:
     # sequence length for training
     sequence_length: int = 64
     # convolution dimension
-    conv_dim: int = 2
+    conv_dim: int = 4
     # dt rank
     dt_rank: Union[int, str] = "auto"
     # state dimension

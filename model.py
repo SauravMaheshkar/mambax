@@ -3,13 +3,27 @@ from typing import Optional
 
 import jax
 import jax.numpy as jnp
-import jaxtyping
 from einops import einsum, repeat
 from flax import nnx
 from huggingface_hub import hf_hub_download
+from jaxtyping import Array, Float, Int
 from safetensors import safe_open
 
 from configs.default import Config
+
+
+def _scan_combine(
+    left: tuple[Array, Array], right: tuple[Array, Array]
+) -> tuple[Array, Array]:
+    """Composes two steps of the linear recurrence h_t = a_t * h_{t-1} + b_t.
+
+    Applying `left` then `right` is the same as one step with
+    a = a_l * a_r and b = a_r * b_l + b_r, which is associative, so
+    `jax.lax.associative_scan` can evaluate the whole sequence in O(log L) depth.
+    """
+    a_left, b_left = left
+    a_right, b_right = right
+    return a_left * a_right, a_right * b_left + b_right
 
 
 class MambaBlock(nnx.Module):
@@ -44,13 +58,14 @@ class MambaBlock(nnx.Module):
             rngs=rngs,
         )
 
+        # Depthwise and causal: each channel only sees its own past conv_dim - 1 steps.
         self.conv1d = nnx.Conv(
             in_features=hidden_dim,
             out_features=hidden_dim,
             use_bias=conv_bias,
             kernel_size=conv_dim,
-            # feature_group_count=hidden_dim,
-            padding=conv_dim - 1,
+            feature_group_count=hidden_dim,
+            padding=((conv_dim - 1, 0),),
             rngs=rngs,
         )
 
@@ -69,12 +84,12 @@ class MambaBlock(nnx.Module):
         )
 
         A = repeat(
-            jax.numpy.arange(1, state_dim + 1).astype(jax.numpy.float32),
+            jnp.arange(1, state_dim + 1, dtype=jnp.float32),
             "n -> d n",
             d=hidden_dim,
         )
-        self.A_log = nnx.Param(jax.lax.log(A))
-        self.D = nnx.Param(jax.numpy.ones(hidden_dim))
+        self.A_log = nnx.Param(jnp.log(A))
+        self.D = nnx.Param(jnp.ones(hidden_dim))
 
         self.out_proj = nnx.Linear(
             in_features=hidden_dim,
@@ -84,64 +99,50 @@ class MambaBlock(nnx.Module):
         )
 
     @jax.named_scope("mamba_block")
-    def __call__(self, x: jaxtyping.Array) -> jaxtyping.Array:
-        (B, L, D) = x.shape
+    def __call__(
+        self, x: Float[Array, "batch seq model_dim"]
+    ) -> Float[Array, "batch seq model_dim"]:
+        x, res = jnp.split(self.in_proj(x), [self.hidden_dim], axis=-1)
 
-        x_and_res = self.in_proj(x)
-        x, res = jax.numpy.split(x_and_res, [self.hidden_dim], axis=-1)
-
-        x = self.conv1d(x)[:, :L, :]
-        x = nnx.silu(x)
+        x = nnx.silu(self.conv1d(x))
 
         y = self.ssm(x)
         y = y * nnx.silu(res)
         return self.out_proj(y)
 
-    def ssm(self, x: jaxtyping.Array) -> jaxtyping.Array:
-        (_, N) = self.A_log.shape
+    def ssm(
+        self, x: Float[Array, "batch seq hidden_dim"]
+    ) -> Float[Array, "batch seq hidden_dim"]:
+        A = -jnp.exp(self.A_log[...])
 
-        A = -jax.numpy.exp(self.A_log.value)
-        D = self.D.value
-
-        x_dbl = self.x_proj(x)
-        assert x_dbl.shape[-1] == self.dt_rank + 2 * self.state_dim
-
-        (delta, B, C) = jax.numpy.split(
-            x_dbl, [self.dt_rank, self.dt_rank + self.state_dim], axis=-1
+        (delta, B, C) = jnp.split(
+            self.x_proj(x), [self.dt_rank, self.dt_rank + self.state_dim], axis=-1
         )
         delta = nnx.softplus(self.dt_proj(delta))
 
-        y = self.selective_scan(x, delta, A, B, C, D)
-        return y
+        return self.selective_scan(x, delta, A, B, C, self.D[...])
 
+    @staticmethod
     def selective_scan(
-        self,
-        x: jaxtyping.Array,
-        delta: jaxtyping.Array,
-        A: jaxtyping.Array,
-        B: jaxtyping.Array,
-        C: jaxtyping.Array,
-        D: jaxtyping.Array,
-    ) -> jaxtyping.Array:
-        (b, l, d_in) = x.shape  # noqa: E741
-        n = A.shape[1]
+        u: Float[Array, "batch seq hidden_dim"],
+        delta: Float[Array, "batch seq hidden_dim"],
+        A: Float[Array, "hidden_dim state_dim"],
+        B: Float[Array, "batch seq state_dim"],
+        C: Float[Array, "batch seq state_dim"],
+        D: Float[Array, " hidden_dim"],
+    ) -> Float[Array, "batch seq hidden_dim"]:
+        """Runs the discretized SSM over the sequence.
 
-        deltaA = jax.numpy.exp(einsum(delta, A, "b l d_in, d_in n -> b l d_in n"))
-        deltaB_u = einsum(delta, B, x, "b l d_in, b l n, b l d_in -> b l d_in n")
+        h_t = exp(Δ_t A) h_{t-1} + Δ_t B_t u_t
+        y_t = C_t h_t + D u_t
+        """
+        deltaA = jnp.exp(einsum(delta, A, "b l d, d n -> b l d n"))
+        deltaB_u = einsum(delta, B, u, "b l d, b l n, b l d -> b l d n")
 
-        x = jax.numpy.zeros((b, d_in, n))
-        ys = []
-        for i in range(l):
-            x = deltaA[:, i] * x + deltaB_u[:, i]
-            y = einsum(x, C[:, i, :], "b d_in n, b n -> b d_in")
-            ys.append(y)
+        _, h = jax.lax.associative_scan(_scan_combine, (deltaA, deltaB_u), axis=1)
 
-        y = jax.numpy.stack(ys, axis=1)
-        residual = einsum(x, D, "b d n, d -> b d")  # shape: (b, d)
-        residual = jax.numpy.repeat(residual[:, None, :], l, axis=1)  # (b, l, d)
-        y = y + residual
-
-        return y
+        y = einsum(h, C, "b l d n, b l n -> b l d")
+        return y + u * D
 
 
 class ResidualBlock(nnx.Module):
@@ -180,7 +181,9 @@ class ResidualBlock(nnx.Module):
 
         self.norm = nnx.RMSNorm(num_features=model_dim, rngs=rngs)
 
-    def __call__(self, x: jaxtyping.Array) -> jaxtyping.Array:
+    def __call__(
+        self, x: Float[Array, "batch seq model_dim"]
+    ) -> Float[Array, "batch seq model_dim"]:
         return self.mixer(self.norm(x)) + x
 
 
@@ -235,21 +238,30 @@ class Mamba(nnx.Module):
 
         self.norm_f = nnx.RMSNorm(num_features=model_dim, rngs=rngs)
 
-        self.lm_head = nnx.Linear(
-            in_features=model_dim,
-            out_features=vocab_size,
-            use_bias=False,
+    @classmethod
+    def from_config(cls, config: Config, *, rngs: nnx.Rngs) -> "Mamba":
+        return cls(
+            vocab_size=config.vocab_size,
+            model_dim=config.model_dim,
+            hidden_dim=config.hidden_dim,
+            conv_dim=config.conv_dim,
+            dt_rank=config.dt_rank,
+            state_dim=config.state_dim,
+            num_layers=config.num_layers,
+            use_bias=config.use_bias,
+            conv_bias=config.conv_bias,
             rngs=rngs,
         )
 
-    def __call__(self, x: jaxtyping.Array) -> jaxtyping.Array:
+    def __call__(
+        self, x: Int[Array, "batch seq"]
+    ) -> Float[Array, "batch seq vocab_size"]:
         x = self.embedding(x)
         for layer in self.layers:
             x = layer(x)
 
-        x = self.norm_f(x)
-        # tie output projection to embedding weights.
-        return x @ jnp.transpose(self.embedding.embedding, (1, 0))
+        # Output projection is tied to the embedding weights.
+        return self.embedding.attend(self.norm_f(x))
 
     @property
     def num_params(self) -> int:
@@ -261,7 +273,7 @@ class Mamba(nnx.Module):
         return nnx.split(self, nnx.Param, ...)[1]
 
     @property
-    def state_dict(self) -> dict[str, jaxtyping.Array]:
+    def state_dict(self) -> dict[str, Array]:
         """Splits state from the graph and returns it as a dictionary.
 
         It can be used for serialization with orbax."""
@@ -276,6 +288,7 @@ class Mamba(nnx.Module):
             path: The directory path to save the model state to.
         """
         import orbax.checkpoint as ocp
+
         state = nnx.state(self)
         checkpointer = ocp.PyTreeCheckpointer()
         checkpointer.save(f"{path}/mamba", state, **kwargs)
@@ -361,7 +374,9 @@ class Mamba(nnx.Module):
             path: The directory path to load the model state from.
         """
         import orbax.checkpoint as ocp
+
         checkpointer = ocp.PyTreeCheckpointer()
         state = checkpointer.restore(f"{path}/mamba", item=nnx.state(self))
         nnx.update(self, state)
         return self
+
