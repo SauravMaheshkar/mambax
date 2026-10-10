@@ -46,6 +46,8 @@ class Config:
     conv_bias: bool = True
     # RMSNorm epsilon
     norm_eps: float = 1e-5
+    # sequence chunk length for the memory-bounded selective scan
+    scan_chunk_size: int = 32
     # whether to use weights and biases
     use_wandb: bool = False
     # weights and biases project

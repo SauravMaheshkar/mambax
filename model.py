@@ -2,7 +2,7 @@ import json
 
 import jax
 import jax.numpy as jnp
-from einops import einsum, repeat
+from einops import einsum, rearrange, repeat
 from flax import nnx
 from flax.typing import PathParts
 from huggingface_hub import hf_hub_download
@@ -70,6 +70,7 @@ class MambaBlock(nnx.Module):
         state_dim: int,
         use_bias: bool = False,
         conv_bias: bool = True,
+        scan_chunk_size: int = 32,
         rngs: nnx.Rngs,
     ):
         super().__init__()
@@ -81,6 +82,7 @@ class MambaBlock(nnx.Module):
         self.state_dim = state_dim
         self.use_bias = use_bias
         self.conv_bias = conv_bias
+        self.scan_chunk_size = scan_chunk_size
 
         self.in_proj = nnx.Linear(
             in_features=model_dim,
@@ -153,7 +155,9 @@ class MambaBlock(nnx.Module):
         )
         delta = nnx.softplus(self.dt_proj(delta))
 
-        return self.selective_scan(x, delta, A, B, C, self.D[...])
+        return self.selective_scan(
+            x, delta, A, B, C, self.D[...], chunk_size=self.scan_chunk_size
+        )
 
     @staticmethod
     def selective_scan(
@@ -163,18 +167,50 @@ class MambaBlock(nnx.Module):
         B: Float[Array, "batch seq state_dim"],
         C: Float[Array, "batch seq state_dim"],
         D: Float[Array, " hidden_dim"],
+        chunk_size: int,
     ) -> Float[Array, "batch seq hidden_dim"]:
         """Runs the discretized SSM over the sequence.
 
         h_t = exp(Δ_t A) h_{t-1} + Δ_t B_t u_t
         y_t = C_t h_t + D u_t
+
+        A whole-sequence scan keeps several (batch, seq, hidden, state) tensors
+        alive for the backward pass, per layer. Instead the sequence is split into
+        chunks: each chunk runs as an associative scan seeded with the incoming
+        state, only that state crosses chunk boundaries, and chunks are recomputed
+        in the backward pass. Memory is ~(batch, hidden, state) * (seq / chunk_size)
+        saved states plus one chunk's worth of temporaries:
+
+                 chunk 0           chunk 1           chunk 2
+              [t_0 .. t_c-1]    [t_c .. t_2c-1]   [t_2c .. ]
+                    | scan            | scan            | scan
+            h=0 ----+------> h_c -----+------> h_2c ----+------> ...
+                             (saved)           (saved)
         """
-        deltaA = jnp.exp(einsum(delta, A, "b l d, d n -> b l d n"))
-        deltaB_u = einsum(delta, B, u, "b l d, b l n, b l d -> b l d n")
+        batch, seq_len, _ = u.shape
+        # Padded steps come last and their outputs are sliced off, so they can't
+        # leak into real positions.
+        pad = ((0, 0), (0, -seq_len % chunk_size), (0, 0))
+        chunks = tuple(
+            rearrange(jnp.pad(t, pad), "b (c l) x -> c b l x", l=chunk_size)
+            for t in (u, delta, B, C)
+        )
 
-        _, h = jax.lax.associative_scan(_scan_combine, (deltaA, deltaB_u), axis=1)
+        @jax.checkpoint
+        def scan_chunk(h, chunk):
+            u_c, delta_c, B_c, C_c = chunk
+            deltaA = jnp.exp(einsum(delta_c, A, "b l d, d n -> b l d n"))
+            deltaB_u = einsum(delta_c, B_c, u_c, "b l d, b l n, b l d -> b l d n")
+            # decay_t = prod of deltaA up to t, h_local_t = state if h started at 0.
+            decay, h_local = jax.lax.associative_scan(
+                _scan_combine, (deltaA, deltaB_u), axis=1
+            )
+            h_chunk = decay * h[:, None] + h_local
+            return h_chunk[:, -1], einsum(h_chunk, C_c, "b l d n, b l n -> b l d")
 
-        y = einsum(h, C, "b l d n, b l n -> b l d")
+        h0 = jnp.zeros((batch, *A.shape), u.dtype)
+        _, y = jax.lax.scan(scan_chunk, h0, chunks)
+        y = rearrange(y, "c b l d -> b (c l) d")[:, :seq_len]
         return y + u * D
 
 
@@ -190,6 +226,7 @@ class ResidualBlock(nnx.Module):
         use_bias: bool = False,
         conv_bias: bool = True,
         norm_eps: float = 1e-5,
+        scan_chunk_size: int = 32,
         rngs: nnx.Rngs,
     ):
         super().__init__()
@@ -210,6 +247,7 @@ class ResidualBlock(nnx.Module):
             state_dim=state_dim,
             use_bias=use_bias,
             conv_bias=conv_bias,
+            scan_chunk_size=scan_chunk_size,
             rngs=rngs,
         )
 
@@ -235,6 +273,7 @@ class Mamba(nnx.Module):
         use_bias: bool = False,
         conv_bias: bool = True,
         norm_eps: float = 1e-5,
+        scan_chunk_size: int = 32,
         rngs: nnx.Rngs,
     ):
         super().__init__()
@@ -266,6 +305,7 @@ class Mamba(nnx.Module):
                     use_bias=use_bias,
                     conv_bias=conv_bias,
                     norm_eps=norm_eps,
+                    scan_chunk_size=scan_chunk_size,
                     rngs=rngs,
                 )
                 for _ in range(self.num_layers)
@@ -287,6 +327,7 @@ class Mamba(nnx.Module):
             use_bias=config.use_bias,
             conv_bias=config.conv_bias,
             norm_eps=config.norm_eps,
+            scan_chunk_size=config.scan_chunk_size,
             rngs=rngs,
         )
 
