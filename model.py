@@ -1,5 +1,4 @@
 import json
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -10,6 +9,9 @@ from jaxtyping import Array, Float, Int
 from safetensors import safe_open
 
 from configs.default import Config
+
+
+ParamPath = tuple[str | int, ...]
 
 
 def _scan_combine(
@@ -156,6 +158,7 @@ class ResidualBlock(nnx.Module):
         state_dim: int,
         use_bias: bool = False,
         conv_bias: bool = True,
+        norm_eps: float = 1e-5,
         rngs: nnx.Rngs,
     ):
         super().__init__()
@@ -179,7 +182,7 @@ class ResidualBlock(nnx.Module):
             rngs=rngs,
         )
 
-        self.norm = nnx.RMSNorm(num_features=model_dim, rngs=rngs)
+        self.norm = nnx.RMSNorm(num_features=model_dim, epsilon=norm_eps, rngs=rngs)
 
     def __call__(
         self, x: Float[Array, "batch seq model_dim"]
@@ -200,6 +203,7 @@ class Mamba(nnx.Module):
         num_layers: int,
         use_bias: bool = False,
         conv_bias: bool = True,
+        norm_eps: float = 1e-5,
         rngs: nnx.Rngs,
     ):
         super().__init__()
@@ -230,13 +234,14 @@ class Mamba(nnx.Module):
                     state_dim=state_dim,
                     use_bias=use_bias,
                     conv_bias=conv_bias,
+                    norm_eps=norm_eps,
                     rngs=rngs,
                 )
                 for _ in range(self.num_layers)
             ]
         )
 
-        self.norm_f = nnx.RMSNorm(num_features=model_dim, rngs=rngs)
+        self.norm_f = nnx.RMSNorm(num_features=model_dim, epsilon=norm_eps, rngs=rngs)
 
     @classmethod
     def from_config(cls, config: Config, *, rngs: nnx.Rngs) -> "Mamba":
@@ -250,6 +255,7 @@ class Mamba(nnx.Module):
             num_layers=config.num_layers,
             use_bias=config.use_bias,
             conv_bias=config.conv_bias,
+            norm_eps=config.norm_eps,
             rngs=rngs,
         )
 
@@ -297,74 +303,58 @@ class Mamba(nnx.Module):
     def from_pretrained(
         cls,
         repo_id: str,
-        token: Optional[str] = None,
+        revision: str | None = None,
+        token: str | None = None,
     ) -> "Mamba":
-        config_path = hf_hub_download(
-            repo_id=repo_id, filename="config.json", repo_type="model", token=token
-        )
-        with open(config_path, "r") as f:
-            config_data = json.load(f)
+        """Loads a `transformers`-format checkpoint, e.g. `state-spaces/mamba-130m-hf`.
 
-        args = Config(
-            model_dim=config_data["d_model"],
-            num_layers=config_data["n_layer"],
-            vocab_size=config_data["vocab_size"],
-        )
+        Loading is strict: any missing, unexpected or mis-shaped parameter raises.
+        """
 
-        ckpt_path = hf_hub_download(
-            repo_id=repo_id,
-            filename="model.safetensors",
-            repo_type="model",
-            revision="refs/pr/1",
-            token=token,
-        )
+        def download(filename: str) -> str:
+            return hf_hub_download(
+                repo_id=repo_id, filename=filename, revision=revision, token=token
+            )
 
-        with safe_open(ckpt_path, framework="flax", device="cpu") as f:
-            loaded_params = {}
-            for key in f.keys():
-                clean_key = key.replace("backbone.", "")
-                if clean_key == "embedding.weight":
-                    clean_key = "embedding.embedding"
-                replacements = [
-                    (".conv1d.weight", ".conv1d.kernel"),
-                    (".dt_proj.weight", ".dt_proj.kernel"),
-                    (".in_proj.weight", ".in_proj.kernel"),
-                    (".out_proj.weight", ".out_proj.kernel"),
-                    (".x_proj.weight", ".x_proj.kernel"),
-                    (".norm.weight", ".norm.scale"),
-                    ("norm_f.weight", "norm_f.scale"),
-                ]
-                for old, new in replacements:
-                    if clean_key.endswith(old):
-                        clean_key = clean_key.replace(old, new)
-                loaded_params[clean_key] = f.get_tensor(key)
+        with open(download("config.json")) as f:
+            hf_config = json.load(f)
 
-        model = cls(
-            vocab_size=args.vocab_size,
-            model_dim=args.model_dim,
-            hidden_dim=args.hidden_dim,
-            conv_dim=args.conv_dim,
-            dt_rank=args.dt_rank,
-            state_dim=args.state_dim,
-            num_layers=args.num_layers,
-            use_bias=getattr(args, "use_bias", False),
-            conv_bias=getattr(args, "conv_bias", True),
-            rngs=nnx.Rngs(0),
+        config = Config(
+            vocab_size=hf_config["vocab_size"],
+            model_dim=hf_config["hidden_size"],
+            num_layers=hf_config["num_hidden_layers"],
+            state_dim=hf_config["state_size"],
+            expand=hf_config["expand"],
+            conv_dim=hf_config["conv_kernel"],
+            dt_rank=hf_config["time_step_rank"],
+            use_bias=hf_config["use_bias"],
+            conv_bias=hf_config["use_conv_bias"],
+            norm_eps=hf_config["layer_norm_epsilon"],
         )
 
-        # Split and update state
-        graph, model_state, _ = nnx.split(model, nnx.Param, ...)
-        flat_state = nnx.to_pure_dict(model_state)
-        missing = []
-        for k in flat_state:
-            if k in loaded_params:
-                flat_state[k] = loaded_params[k]
-            else:
-                missing.append(k)
-        if missing:
-            print(f"Warning: Missing parameters for keys: {missing}")
+        # Every weight gets overwritten, so skip the random init.
+        model = nnx.eval_shape(lambda: cls.from_config(config, rngs=nnx.Rngs(0)))
+        expected = {
+            path: param.shape for path, param in nnx.state(model, nnx.Param).flat_state()
+        }
 
-        model = nnx.merge(graph, model_state)
+        with safe_open(download("model.safetensors"), framework="flax") as f:
+            loaded = dict(_hf_to_nnx(key, f.get_tensor(key)) for key in f.keys())
+
+        missing = sorted(map(str, expected.keys() - loaded.keys()))
+        unexpected = sorted(map(str, loaded.keys() - expected.keys()))
+        mismatched = sorted(
+            f"{path}: expected {expected[path]}, got {loaded[path].shape}"
+            for path in expected.keys() & loaded.keys()
+            if expected[path] != loaded[path].shape
+        )
+        if missing or unexpected or mismatched:
+            raise ValueError(
+                f"Checkpoint {repo_id} does not match the model.\n"
+                f"Missing: {missing}\nUnexpected: {unexpected}\nMismatched: {mismatched}"
+            )
+
+        nnx.update(model, nnx.State.from_flat_path(loaded))
         return model
 
     def load(self, path: str) -> "Mamba":
@@ -380,3 +370,22 @@ class Mamba(nnx.Module):
         nnx.update(self, state)
         return self
 
+
+def _hf_to_nnx(key: str, tensor: Array) -> tuple[ParamPath, Array]:
+    """Maps a `transformers` Mamba tensor to its NNX parameter path and layout.
+
+    torch Linear stores (out, in) and depthwise Conv1d stores (out, 1, kernel),
+    while NNX expects (in, out) and (kernel, 1, out) respectively.
+    """
+    *module, leaf = key.removeprefix("backbone.").split(".")
+    path = tuple(int(part) if part.isdigit() else part for part in module)
+
+    if path == ("embeddings",):
+        return ("embedding", "embedding"), tensor
+    if leaf != "weight":
+        return (*path, leaf), tensor
+    if path[-1] in ("norm", "norm_f"):
+        return (*path, "scale"), tensor
+    if path[-1] == "conv1d":
+        return (*path, "kernel"), tensor.transpose(2, 1, 0)
+    return (*path, "kernel"), tensor.T
