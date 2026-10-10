@@ -7,7 +7,7 @@ from huggingface_hub import hf_hub_download
 from safetensors import safe_open
 
 from configs.default import Config
-from model import Mamba, MambaBlock
+from model import Mamba, MambaBlock, dt_bias_init
 
 
 PRETRAINED_REPO = "state-spaces/mamba-130m-hf"
@@ -70,6 +70,33 @@ def test_model_is_causal(tiny_model: Mamba, position: int):
 def test_conv_is_depthwise(tiny_model: Mamba):
     mixer = tiny_model.layers[0].mixer
     assert mixer.conv1d.kernel.shape == (mixer.conv_dim, 1, mixer.hidden_dim)
+
+
+def test_dt_bias_init_is_log_uniform_between_bounds():
+    dt_min, dt_max = 1e-3, 1e-1
+    bias = dt_bias_init(dt_min, dt_max)(jax.random.key(0), (100_000,))
+    log_dt = np.log(np.asarray(jax.nn.softplus(bias)))
+
+    assert log_dt.min() >= np.log(dt_min) - 1e-4
+    assert log_dt.max() <= np.log(dt_max) + 1e-4
+    quartiles = np.quantile(log_dt, [0.25, 0.5, 0.75])
+    expected = np.log(dt_min) + np.array([0.25, 0.5, 0.75]) * np.log(dt_max / dt_min)
+    np.testing.assert_allclose(quartiles, expected, atol=0.05)
+
+
+def test_dt_bias_init_clamps_to_floor():
+    bias = dt_bias_init(dt_min=1e-8, dt_max=1e-6, dt_floor=1e-4)(
+        jax.random.key(0), (1_000,)
+    )
+    np.testing.assert_allclose(jax.nn.softplus(bias), 1e-4, rtol=1e-4)
+
+
+def test_dt_proj_uses_mamba_init(tiny_model: Mamba):
+    dt_proj = tiny_model.layers[0].mixer.dt_proj
+    dt = jax.nn.softplus(dt_proj.bias[...])
+
+    assert jnp.all((dt >= 1e-3 * (1 - 1e-4)) & (dt <= 1e-1 * (1 + 1e-4)))
+    assert jnp.all(jnp.abs(dt_proj.kernel[...]) <= tiny_model.dt_rank**-0.5)
 
 
 def test_pretrained_loads_every_checkpoint_tensor(pretrained_model: Mamba):

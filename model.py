@@ -14,6 +14,37 @@ from configs.default import Config
 ParamPath = tuple[str | int, ...]
 
 
+def dt_kernel_init(dt_rank: int) -> nnx.Initializer:
+    """Uniform in [-dt_rank^-0.5, dt_rank^-0.5], so the projection keeps unit variance."""
+    bound = dt_rank**-0.5
+
+    def init(key: Array, shape: tuple[int, ...], dtype=jnp.float32) -> Array:
+        return jax.random.uniform(key, shape, dtype, minval=-bound, maxval=bound)
+
+    return init
+
+
+def dt_bias_init(
+    dt_min: float = 1e-3, dt_max: float = 1e-1, dt_floor: float = 1e-4
+) -> nnx.Initializer:
+    """Bias such that softplus(bias) = Δ is log-uniform in [dt_min, dt_max].
+
+    Δ sets each channel's timescale: small Δ remembers long context, large Δ
+    tracks the latest input. The default init (bias = 0) pins every channel at
+    Δ = softplus(0) ≈ 0.69, so all of them start out forgetting fast.
+    """
+
+    def init(key: Array, shape: tuple[int, ...], dtype=jnp.float32) -> Array:
+        log_dt = jax.random.uniform(
+            key, shape, dtype, minval=jnp.log(dt_min), maxval=jnp.log(dt_max)
+        )
+        dt = jnp.maximum(jnp.exp(log_dt), dt_floor)
+        # Inverse of softplus(x) = log(1 + e^x).
+        return dt + jnp.log(-jnp.expm1(-dt))
+
+    return init
+
+
 def _scan_combine(
     left: tuple[Array, Array], right: tuple[Array, Array]
 ) -> tuple[Array, Array]:
@@ -82,6 +113,8 @@ class MambaBlock(nnx.Module):
             in_features=dt_rank,
             out_features=hidden_dim,
             use_bias=True,
+            kernel_init=dt_kernel_init(dt_rank),
+            bias_init=dt_bias_init(),
             rngs=rngs,
         )
 
