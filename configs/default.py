@@ -1,6 +1,6 @@
 import dataclasses
 import math
-from typing import Union
+from typing import Literal
 
 
 @dataclasses.dataclass
@@ -28,7 +28,7 @@ class Config:
     # convolution dimension
     conv_dim: int = 4
     # dt rank
-    dt_rank: Union[int, str] = "auto"
+    dt_rank: int | Literal["auto"] = "auto"
     # state dimension
     state_dim: int = 16
     # expand factor
@@ -48,20 +48,25 @@ class Config:
     # weights and biases entity
     wandb_entity: str | None = None
 
-    def __post_init__(self):
-        self.hidden_dim = int(self.expand * self.model_dim)
+    # Derived values are properties, not __post_init__ assignments, so that
+    # command line overrides like --config.model_dim=256 propagate to them.
 
+    @property
+    def hidden_dim(self) -> int:
+        return self.expand * self.model_dim
+
+    @property
+    def resolved_dt_rank(self) -> int:
         if self.dt_rank == "auto":
-            self.dt_rank = math.ceil(self.model_dim / 16)
+            return math.ceil(self.model_dim / 16)
+        return self.dt_rank
 
-        if (
-            self.vocab_size is not None
-            and self.vocab_size % self.pad_vocab_size_multiple != 0
-        ):
-            self.vocab_size += (
-                self.pad_vocab_size_multiple
-                - self.vocab_size % self.pad_vocab_size_multiple
-            )
+    @property
+    def padded_vocab_size(self) -> int:
+        if self.vocab_size is None:
+            raise ValueError("vocab_size is unset, set it from the dataset or checkpoint")
+        multiple = self.pad_vocab_size_multiple
+        return math.ceil(self.vocab_size / multiple) * multiple
 
 
 def get_config():
