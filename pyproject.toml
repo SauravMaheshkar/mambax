@@ -30,12 +30,15 @@ line-length = 90
 
 [tool.ruff.lint]
 select = ["E", "F", "I001"]
+# jaxtyping shape strings like "batch seq" are not forward references.
+ignore = ["F722"]
 
 [tool.ruff.lint.isort]
 lines-after-imports = 2
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 filterwarnings = [
     "ignore::DeprecationWarning",
 	"ignore::UserWarning"
