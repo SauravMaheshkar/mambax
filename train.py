@@ -31,7 +31,7 @@ def train_step(
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
     (loss, logits), grads = grad_fn(model, batch)
     metrics.update(loss=loss, logits=logits, labels=batch[1])
-    optimizer.update(grads)
+    optimizer.update(model, grads)
 
 
 def train_and_evaluate(config: default.Config, workdir: str) -> None:
@@ -77,7 +77,9 @@ def train_and_evaluate(config: default.Config, workdir: str) -> None:
     if config.use_wandb:
         wandb.summary["num_params"] = model.num_params
 
-    optimizer = nnx.Optimizer(model, optax.adamw(config.learning_rate, nesterov=True))
+    optimizer = nnx.Optimizer(
+        model, optax.adamw(config.learning_rate, nesterov=True), wrt=nnx.Param
+    )
     metrics = nnx.MultiMetric(
         loss=nnx.metrics.Average("loss"),
     )
