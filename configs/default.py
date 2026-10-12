@@ -20,8 +20,16 @@ class Config:
     num_layers: int = 4
     # batch size for training
     batch_size: int = 16
-    # learning rate
+    # peak learning rate, reached after warmup_steps, then cosine-decayed to 0 at
+    # n_iterations
     learning_rate: float = 1e-3
+    # steps of linear warmup from 0 to learning_rate
+    warmup_steps: int = 100
+    # AdamW weight decay, on matrices and the embedding only (not on norms, biases,
+    # A_log or D)
+    weight_decay: float = 0.1
+    # gradients are clipped to this global norm
+    grad_clip_norm: float = 1.0
     # random seed for model initialization
     seed: int = 42
     # number of iterations

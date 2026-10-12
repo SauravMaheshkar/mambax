@@ -57,6 +57,41 @@ def evaluate(model: Mamba, val: TokenStream, config: default.Config) -> float:
     return float(np.mean([eval_step(model, jax.device_put(batch)) for batch in batches]))
 
 
+def weight_decay_mask(params: nnx.State) -> nnx.State:
+    """Decays matrices and the embedding, never norms, biases, D or A_log.
+
+    A_log is 2-D but holds each channel's decay rates, which weight decay would
+    drag toward A = -1 (mamba_ssm excludes it, D and the dt bias too).
+    """
+    return nnx.map_state(lambda path, p: p.ndim >= 2 and path[-1] != "A_log", params)
+
+
+def make_optimizer(model: Mamba, config: default.Config) -> nnx.Optimizer:
+    """AdamW with linear warmup, cosine decay to 0 and global-norm gradient clipping."""
+    if not 0 <= config.warmup_steps < config.n_iterations:
+        raise ValueError(
+            f"warmup_steps ({config.warmup_steps}) must be in "
+            f"[0, n_iterations={config.n_iterations})"
+        )
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=config.learning_rate,
+        warmup_steps=config.warmup_steps,
+        decay_steps=config.n_iterations,
+        end_value=0.0,
+    )
+    tx = optax.chain(
+        optax.clip_by_global_norm(config.grad_clip_norm),
+        optax.adamw(
+            schedule,
+            weight_decay=config.weight_decay,
+            mask=weight_decay_mask,
+            nesterov=True,
+        ),
+    )
+    return nnx.Optimizer(model, tx, wrt=nnx.Param)
+
+
 def check_token_budget(data: TokenData, config: default.Config) -> None:
     """Fails before training, not hours in, when the data can't cover the run."""
     available = num_train_batches(data.train, config.batch_size, config.sequence_length)
@@ -94,14 +129,12 @@ def train_and_evaluate(config: default.Config, workdir: str) -> dict[str, list[f
 
     config = dataclasses.replace(config, vocab_size=data.vocab_size)
     model = Mamba.from_config(config, rngs=nnx.Rngs(config.seed))
+    optimizer = make_optimizer(model, config)
 
     logging.info(f"Total number of parameters: {model.num_params:_}")
     if config.use_wandb:
         wandb.summary["num_params"] = model.num_params
 
-    optimizer = nnx.Optimizer(
-        model, optax.adamw(config.learning_rate, nesterov=True), wrt=nnx.Param
-    )
     metrics = nnx.MultiMetric(loss=nnx.metrics.Average("loss"))
     history: dict[str, list[float]] = {"train_loss": [], "val_loss": []}
 
