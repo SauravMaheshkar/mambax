@@ -71,6 +71,7 @@ class MambaBlock(nnx.Module):
         use_bias: bool = False,
         conv_bias: bool = True,
         scan_chunk_size: int = 32,
+        dtype: jnp.dtype = jnp.float32,
         rngs: nnx.Rngs,
     ):
         super().__init__()
@@ -88,6 +89,7 @@ class MambaBlock(nnx.Module):
             in_features=model_dim,
             out_features=hidden_dim * 2,
             use_bias=use_bias,
+            dtype=dtype,
             rngs=rngs,
         )
 
@@ -99,6 +101,7 @@ class MambaBlock(nnx.Module):
             kernel_size=conv_dim,
             feature_group_count=hidden_dim,
             padding=((conv_dim - 1, 0),),
+            dtype=dtype,
             rngs=rngs,
         )
 
@@ -106,9 +109,12 @@ class MambaBlock(nnx.Module):
             in_features=hidden_dim,
             out_features=dt_rank + state_dim * 2,
             use_bias=False,
+            dtype=dtype,
             rngs=rngs,
         )
 
+        # Kept in float32 whatever the compute dtype: Δ sets the decay exp(ΔA), and
+        # bf16's 8 mantissa bits would visibly distort long timescales.
         self.dt_proj = nnx.Linear(
             in_features=dt_rank,
             out_features=hidden_dim,
@@ -130,6 +136,7 @@ class MambaBlock(nnx.Module):
             in_features=hidden_dim,
             out_features=model_dim,
             use_bias=use_bias,
+            dtype=dtype,
             rngs=rngs,
         )
 
@@ -153,11 +160,20 @@ class MambaBlock(nnx.Module):
         (delta, B, C) = jnp.split(
             self.x_proj(x), [self.dt_rank, self.dt_rank + self.state_dim], axis=-1
         )
-        delta = nnx.softplus(self.dt_proj(delta))
+        delta = nnx.softplus(self.dt_proj(delta.astype(jnp.float32)))
 
-        return self.selective_scan(
-            x, delta, A, B, C, self.D[...], chunk_size=self.scan_chunk_size
+        # The recurrence accumulates over the whole sequence, so it runs in float32.
+        f32 = jnp.float32
+        y = self.selective_scan(
+            x.astype(f32),
+            delta,
+            A,
+            B.astype(f32),
+            C.astype(f32),
+            self.D[...],
+            chunk_size=self.scan_chunk_size,
         )
+        return y.astype(x.dtype)
 
     @staticmethod
     def selective_scan(
@@ -227,6 +243,7 @@ class ResidualBlock(nnx.Module):
         conv_bias: bool = True,
         norm_eps: float = 1e-5,
         scan_chunk_size: int = 32,
+        dtype: jnp.dtype = jnp.float32,
         rngs: nnx.Rngs,
     ):
         super().__init__()
@@ -248,14 +265,18 @@ class ResidualBlock(nnx.Module):
             use_bias=use_bias,
             conv_bias=conv_bias,
             scan_chunk_size=scan_chunk_size,
+            dtype=dtype,
             rngs=rngs,
         )
 
-        self.norm = nnx.RMSNorm(num_features=model_dim, epsilon=norm_eps, rngs=rngs)
+        self.norm = nnx.RMSNorm(
+            num_features=model_dim, epsilon=norm_eps, dtype=dtype, rngs=rngs
+        )
 
     def __call__(
         self, x: Float[Array, "batch seq model_dim"]
     ) -> Float[Array, "batch seq model_dim"]:
+        # x is the float32 residual stream, so the sum promotes back to float32.
         return self.mixer(self.norm(x)) + x
 
 
@@ -274,6 +295,7 @@ class Mamba(nnx.Module):
         conv_bias: bool = True,
         norm_eps: float = 1e-5,
         scan_chunk_size: int = 32,
+        dtype: jnp.dtype = jnp.float32,
         rngs: nnx.Rngs,
     ):
         super().__init__()
@@ -291,6 +313,7 @@ class Mamba(nnx.Module):
         self.embedding = nnx.Embed(
             num_embeddings=vocab_size,
             features=model_dim,
+            dtype=dtype,
             rngs=rngs,
         )
 
@@ -306,13 +329,16 @@ class Mamba(nnx.Module):
                     conv_bias=conv_bias,
                     norm_eps=norm_eps,
                     scan_chunk_size=scan_chunk_size,
+                    dtype=dtype,
                     rngs=rngs,
                 )
                 for _ in range(self.num_layers)
             ]
         )
 
-        self.norm_f = nnx.RMSNorm(num_features=model_dim, epsilon=norm_eps, rngs=rngs)
+        self.norm_f = nnx.RMSNorm(
+            num_features=model_dim, epsilon=norm_eps, dtype=dtype, rngs=rngs
+        )
 
     @classmethod
     def from_config(cls, config: Config, *, rngs: nnx.Rngs) -> "Mamba":
@@ -328,18 +354,22 @@ class Mamba(nnx.Module):
             conv_bias=config.conv_bias,
             norm_eps=config.norm_eps,
             scan_chunk_size=config.scan_chunk_size,
+            dtype=jnp.dtype(config.compute_dtype),
             rngs=rngs,
         )
 
     def __call__(
         self, x: Int[Array, "batch seq"]
     ) -> Float[Array, "batch seq vocab_size"]:
-        x = self.embedding(x)
+        # Params are float32 and matmuls run in the compute dtype, while the
+        # residual stream, the scan and the logits stay float32 (mixed precision,
+        # like Mamba's residual_in_fp32).
+        x = self.embedding(x).astype(jnp.float32)
         for layer in self.layers:
             x = layer(x)
 
         # Output projection is tied to the embedding weights.
-        return self.embedding.attend(self.norm_f(x))
+        return self.embedding.attend(self.norm_f(x)).astype(jnp.float32)
 
     @property
     def num_params(self) -> int:
