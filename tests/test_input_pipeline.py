@@ -8,18 +8,31 @@ from pathlib import Path
 import datasets
 import numpy as np
 import pytest
+from huggingface_hub import HfApi, HfFileSystem, RepoFile
 
 from input_pipeline import (
-    DATASET,
-    EOS,
-    REVISION,
-    UNK,
-    VOCAB_SIZE,
-    decode,
-    encode,
+    FINEWEB_EOT,
+    FINEWEB_HEADER_BYTES,
+    FINEWEB_MAGIC,
+    FINEWEB_MAX_TRAIN_SHARDS,
+    FINEWEB_REPO,
+    FINEWEB_REVISION,
+    FINEWEB_SPEEDRUN_VAL_TOKENS,
+    FINEWEB_VERSION,
+    FINEWEB_VOCAB_SIZE,
+    TINYSTORIES_EOS,
+    TINYSTORIES_REPO,
+    TINYSTORIES_REVISION,
+    TINYSTORIES_UNK,
+    TINYSTORIES_VOCAB_SIZE,
+    decode_chars,
+    encode_chars,
     eval_batches,
-    load_split,
+    load_fineweb_train,
+    load_tinystories,
     num_train_batches,
+    parse_fineweb_header,
+    read_fineweb_shard,
     train_batches,
 )
 
@@ -115,8 +128,8 @@ VALIDATION_SLICE = "validation[:1%]"
 @pytest.fixture(scope="module")
 def validation_stories() -> list[str]:
     return datasets.load_dataset(
-        DATASET,
-        revision=REVISION,
+        TINYSTORIES_REPO,
+        revision=TINYSTORIES_REVISION,
         data_files={"validation": "data/validation-*.parquet"},
         split=VALIDATION_SLICE,
     )["text"][:]
@@ -129,7 +142,7 @@ def cache_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 @pytest.fixture(scope="module")
 def validation_ids(cache_dir: Path) -> np.memmap:
-    return load_split(VALIDATION_SLICE, cache_dir=cache_dir)
+    return load_tinystories(VALIDATION_SLICE, cache_dir=cache_dir)
 
 
 @pytest.mark.parametrize(
@@ -141,75 +154,77 @@ def validation_ids(cache_dir: Path) -> np.memmap:
     ],
 )
 def test_ascii_round_trips(text: str):
-    ids = encode(text)
+    ids = encode_chars(text)
     assert ids.dtype == np.uint8
-    assert decode(ids) == text
+    assert decode_chars(ids) == text
 
 
 @pytest.mark.parametrize("text", ["â€™", "é", "🐱", "\t", "\x00"])
 def test_characters_outside_vocab_map_to_unk(text: str):
-    assert np.all(encode(text) == UNK)
+    assert np.all(encode_chars(text) == TINYSTORIES_UNK)
 
 
 def test_vocab_ids_are_dense_and_distinct():
     printable = "\n" + "".join(chr(c) for c in range(32, 127))
-    ids = encode(printable)
-    assert sorted(ids) == list(range(2, VOCAB_SIZE))
+    ids = encode_chars(printable)
+    assert sorted(ids) == list(range(2, TINYSTORIES_VOCAB_SIZE))
 
 
-def test_load_split_is_stories_followed_by_eos(
+def test_load_tinystories_is_stories_followed_by_eos(
     validation_stories: list[str], validation_ids: np.ndarray
 ):
     assert validation_ids.dtype == np.uint8
-    assert validation_ids.max() < VOCAB_SIZE
+    assert validation_ids.max() < TINYSTORIES_VOCAB_SIZE
 
-    boundaries = np.flatnonzero(validation_ids == EOS)
+    boundaries = np.flatnonzero(validation_ids == TINYSTORIES_EOS)
     assert len(boundaries) == len(validation_stories)
     assert boundaries[-1] == len(validation_ids) - 1
 
     starts = np.concatenate([[0], boundaries[:-1] + 1])
     for story, start, end in zip(validation_stories[:20], starts, boundaries):
-        np.testing.assert_array_equal(validation_ids[start:end], encode(story))
+        np.testing.assert_array_equal(validation_ids[start:end], encode_chars(story))
 
 
-def test_load_split_chunking_does_not_change_the_stream(
+def test_load_tinystories_chunking_does_not_change_the_stream(
     validation_ids: np.ndarray, tmp_path: Path
 ):
-    rechunked = load_split(VALIDATION_SLICE, cache_dir=tmp_path, chunk_size=7)
+    rechunked = load_tinystories(VALIDATION_SLICE, cache_dir=tmp_path, chunk_size=7)
     np.testing.assert_array_equal(rechunked, validation_ids)
 
 
-def test_load_split_is_a_read_only_memmap(validation_ids: np.ndarray):
+def test_load_tinystories_is_a_read_only_memmap(validation_ids: np.ndarray):
     assert isinstance(validation_ids, np.memmap)
     assert not validation_ids.flags.writeable
 
 
-def test_load_split_reuses_cache_and_leaves_no_temp_files(
+def test_load_tinystories_reuses_cache_and_leaves_no_temp_files(
     validation_ids: np.memmap, cache_dir: Path
 ):
     (cached,) = (cache_dir / "mambax").iterdir()
     modified = cached.stat().st_mtime_ns
 
-    again = load_split(VALIDATION_SLICE, cache_dir=cache_dir)
+    again = load_tinystories(VALIDATION_SLICE, cache_dir=cache_dir)
 
     assert again.filename == validation_ids.filename
     assert cached.stat().st_mtime_ns == modified
     assert [path.name for path in (cache_dir / "mambax").iterdir()] == [cached.name]
 
 
-def test_load_split_caches_each_split_separately(tmp_path: Path):
-    first = load_split("validation[:10]", cache_dir=tmp_path)
-    second = load_split("validation[10:20]", cache_dir=tmp_path)
+def test_load_tinystories_caches_each_split_separately(tmp_path: Path):
+    first = load_tinystories("validation[:10]", cache_dir=tmp_path)
+    second = load_tinystories("validation[10:20]", cache_dir=tmp_path)
 
     assert first.filename != second.filename
-    assert (first == EOS).sum() == (second == EOS).sum() == 10
+    assert (first == TINYSTORIES_EOS).sum() == (second == TINYSTORIES_EOS).sum() == 10
     assert len(list((tmp_path / "mambax").iterdir())) == 2
 
 
 @pytest.mark.parametrize("chunk_size", [0, -1])
-def test_load_split_rejects_non_positive_chunk_size(tmp_path: Path, chunk_size: int):
+def test_load_tinystories_rejects_non_positive_chunk_size(
+    tmp_path: Path, chunk_size: int
+):
     with pytest.raises(ValueError, match="chunk_size must be positive"):
-        load_split(VALIDATION_SLICE, cache_dir=tmp_path, chunk_size=chunk_size)
+        load_tinystories(VALIDATION_SLICE, cache_dir=tmp_path, chunk_size=chunk_size)
 
 
 def test_killed_encode_commits_nothing_and_next_load_recovers(tmp_path: Path):
@@ -218,8 +233,8 @@ def test_killed_encode_commits_nothing_and_next_load_recovers(tmp_path: Path):
         [
             sys.executable,
             "-c",
-            "from input_pipeline import load_split; "
-            f"load_split('validation', cache_dir={str(tmp_path)!r}, chunk_size=1)",
+            "from input_pipeline import load_tinystories; "
+            f"load_tinystories('validation', cache_dir={str(tmp_path)!r}, chunk_size=1)",
         ],
         cwd=Path(__file__).parents[1],
     )
@@ -235,19 +250,102 @@ def test_killed_encode_commits_nothing_and_next_load_recovers(tmp_path: Path):
     assert list(cache.glob("*.u8")) == []
     assert len(list(cache.glob("*.tmp"))) == 1
 
-    recovered = load_split("validation", cache_dir=tmp_path)
+    recovered = load_tinystories("validation", cache_dir=tmp_path)
 
-    assert (recovered == EOS).sum() == 21_990
+    assert (recovered == TINYSTORIES_EOS).sum() == 21_990
     assert list(cache.glob("*.tmp")) == []
 
 
 def test_temp_files_of_live_encoders_are_kept(tmp_path: Path):
-    load_split("validation[:10]", cache_dir=tmp_path)
+    load_tinystories("validation[:10]", cache_dir=tmp_path)
     (cached,) = (tmp_path / "mambax").glob("*.u8")
     cached.unlink()
     live = cached.with_name(f"{cached.name}.{os.getppid()}.tmp")
     live.touch()
 
-    load_split("validation[:10]", cache_dir=tmp_path)
+    load_tinystories("validation[:10]", cache_dir=tmp_path)
 
     assert live.exists()
+
+
+# FineWeb.
+
+
+def write_shard(
+    path: Path,
+    tokens: np.ndarray,
+    *,
+    magic: int = FINEWEB_MAGIC,
+    version: int = FINEWEB_VERSION,
+    claimed_tokens: int | None = None,
+) -> Path:
+    """Writes the modded-nanogpt layout: 256 x int32 header, then uint16 tokens."""
+    header = np.zeros(256, dtype="<i4")
+    header[:3] = magic, version, len(tokens) if claimed_tokens is None else claimed_tokens
+    path.write_bytes(header.tobytes() + tokens.astype("<u2").tobytes())
+    return path
+
+
+def test_read_fineweb_shard_round_trips_the_full_uint16_range(tmp_path: Path):
+    tokens = np.array(
+        [0, 1, FINEWEB_EOT, FINEWEB_VOCAB_SIZE - 1, 2**16 - 1, 42], dtype=np.uint16
+    )
+
+    shard = read_fineweb_shard(write_shard(tmp_path / "shard.bin", tokens))
+
+    assert isinstance(shard, np.memmap)
+    assert shard.dtype == np.uint16
+    assert not shard.flags.writeable
+    np.testing.assert_array_equal(shard, tokens)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"magic": 12345}, "magic 12345"),
+        ({"version": 2}, "version 2"),
+        ({"claimed_tokens": 7}, "header promises"),
+        ({"claimed_tokens": 5}, "header promises"),
+    ],
+)
+def test_read_fineweb_shard_rejects_corrupt_shards(
+    tmp_path: Path, overrides: dict, match: str
+):
+    path = write_shard(tmp_path / "shard.bin", np.arange(6, dtype=np.uint16), **overrides)
+    with pytest.raises(ValueError, match=match):
+        read_fineweb_shard(path)
+
+
+def test_parse_fineweb_header_rejects_truncated_header():
+    with pytest.raises(ValueError, match="expected 1024"):
+        parse_fineweb_header(b"\x00" * 100)
+
+
+@pytest.mark.parametrize("num_shards", [0, -1, FINEWEB_MAX_TRAIN_SHARDS + 1])
+def test_load_fineweb_train_rejects_shard_counts_outside_the_dataset(num_shards: int):
+    with pytest.raises(ValueError, match="num_shards"):
+        load_fineweb_train(num_shards)
+
+
+def test_real_fineweb_val_shard_matches_the_format():
+    """Ranged read of the pinned Hub shard (a few KB, not the 200MB file)."""
+    name = "fineweb_val_000000.bin"
+    with HfFileSystem().open(
+        f"datasets/{FINEWEB_REPO}/{name}",
+        "rb",
+        revision=FINEWEB_REVISION,
+        block_size=4096,
+    ) as f:
+        head = f.read(FINEWEB_HEADER_BYTES + 2 * 64)
+    (info,) = HfApi().get_paths_info(
+        FINEWEB_REPO, [name], repo_type="dataset", revision=FINEWEB_REVISION
+    )
+
+    num_tokens = parse_fineweb_header(head)
+    first_tokens = np.frombuffer(head[FINEWEB_HEADER_BYTES:], dtype="<u2")
+
+    assert isinstance(info, RepoFile)
+    assert info.size == FINEWEB_HEADER_BYTES + 2 * num_tokens
+    assert FINEWEB_SPEEDRUN_VAL_TOKENS + 1 <= num_tokens
+    assert first_tokens[0] == FINEWEB_EOT
+    assert first_tokens.max() < FINEWEB_VOCAB_SIZE

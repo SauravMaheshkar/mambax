@@ -22,6 +22,17 @@ python main.py --workdir=artifacts/ \
     --config.sequence_length=256
 ```
 
+Train on GPT-2-tokenized FineWeb, the [modded-nanogpt speedrun](https://github.com/KellerJordan/modded-nanogpt)
+data. Each train shard is 100M tokens (200MB), downloaded once into the Hugging Face cache.
+For speedrun-comparable val losses evaluate on its fixed 10,485,760 val tokens
+
+```shell
+python main.py --workdir=artifacts/ \
+    --config.dataset=fineweb \
+    --config.fineweb_train_shards=8 \
+    --config.val_tokens=10485760
+```
+
 Log training logs to wandb
 
 ```shell
