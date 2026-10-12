@@ -38,6 +38,11 @@ class Config:
     n_freq_train: int = 100
     # frequency of evaluating the val loss
     n_freq_eval: int = 1000
+    # frequency of checkpointing; a run resumes from the latest checkpoint in its
+    # workdir, and always checkpoints its final step
+    n_freq_checkpoint: int = 1000
+    # number of most recent checkpoints kept in the workdir
+    max_checkpoints_to_keep: int = 2
     # val tokens per evaluation, fixed so val losses stay comparable (the FineWeb
     # speedrun uses input_pipeline.FINEWEB_SPEEDRUN_VAL_TOKENS = 10_485_760)
     val_tokens: int = 65_536

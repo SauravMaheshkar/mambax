@@ -33,6 +33,13 @@ python main.py --workdir=artifacts/ \
     --config.val_tokens=10485760
 ```
 
+Runs checkpoint to `<workdir>/checkpoints` every `n_freq_checkpoint` steps and at the end.
+Rerunning the same command resumes from the latest checkpoint, picking up the data
+stream and the learning rate schedule exactly where it left off, so a run can span
+several sessions (e.g. Kaggle's time limits). A workdir only resumes the run it was
+started with; changing anything other than logging and checkpoint frequency is refused.
+Load the trained model with `train.load_model(workdir)`.
+
 Log training logs to wandb
 
 ```shell

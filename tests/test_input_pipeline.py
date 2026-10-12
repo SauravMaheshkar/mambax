@@ -69,6 +69,18 @@ def test_train_batches_read_every_token_once_in_order(
     np.testing.assert_array_equal(targets, inputs + 1)
 
 
+@pytest.mark.parametrize("lengths", SHARD_LAYOUTS.values(), ids=SHARD_LAYOUTS.keys())
+def test_train_batches_from_a_first_batch_continue_the_full_pass(lengths: list[int]):
+    shards = consecutive_shards(lengths)
+    full = list(train_batches(shards, 2, 3))
+    for first_batch in range(len(full) + 2):
+        resumed = list(train_batches(shards, 2, 3, first_batch=first_batch))
+        assert len(resumed) == max(len(full) - first_batch, 0)
+        for (x, y), (x_full, y_full) in zip(resumed, full[first_batch:]):
+            np.testing.assert_array_equal(x, x_full)
+            np.testing.assert_array_equal(y, y_full)
+
+
 def test_train_batches_shapes_and_dtype():
     for inputs, targets in train_batches(consecutive_shards([10, 15, 15]), 2, 3):
         assert inputs.shape == targets.shape == (2, 3)
