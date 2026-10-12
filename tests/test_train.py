@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 from flax import nnx
 
-from configs.default import Config, Dtype
+from configs.default import Block, Config, Dtype
 from input_pipeline import TINYSTORIES_VOCAB_SIZE, split_microbatches
 from model import Mamba
 from train import (
@@ -235,6 +235,31 @@ def test_weight_decay_skips_norms_biases_and_ssm_parameters(tiny_model: Mamba):
     }
 
 
+def test_weight_decay_skips_mamba2_norms_biases_and_ssm_parameters():
+    config = dataclasses.replace(
+        SMALL, vocab_size=TINYSTORIES_VOCAB_SIZE, block=Block.MAMBA2, head_dim=16
+    )
+    model = Mamba.from_config(config, rngs=nnx.Rngs(0))
+    mask = weight_decay_mask(nnx.state(model, nnx.Param))
+    decayed = {path[-2:] for path, flag in mask.flat_state() if flag}
+    kept = {path[-2:] for path, flag in mask.flat_state() if not flag}
+
+    assert decayed == {
+        ("embedding", "embedding"),
+        ("conv1d", "kernel"),
+        ("in_proj", "kernel"),
+        ("out_proj", "kernel"),
+    }
+    assert kept == {
+        ("mixer", "A_log"),
+        ("mixer", "D"),
+        ("mixer", "dt_bias"),
+        ("conv1d", "bias"),
+        ("norm", "scale"),
+        ("norm_f", "scale"),
+    }
+
+
 def test_learning_rate_warms_up_from_zero(tiny_model: Mamba):
     """The first update runs at lr 0, so it moves nothing; the second does."""
     optimizer = make_optimizer(tiny_model, SMALL)
@@ -377,3 +402,13 @@ def test_bf16_compute_learns(tmp_path: Path):
     uniform = math.log(TINYSTORIES_VOCAB_SIZE)
     assert history["train_loss"][-1] < history["train_loss"][0] < uniform
     assert history["val_loss"][-1] < 0.8 * uniform
+
+
+def test_mamba2_learns(tmp_path: Path):
+    config = dataclasses.replace(
+        SMALL, block=Block.MAMBA2, head_dim=16, scan_chunk_size=16
+    )
+    history = train_and_evaluate(config, str(tmp_path))
+    uniform = math.log(TINYSTORIES_VOCAB_SIZE)
+    assert history["train_loss"][-1] < history["train_loss"][0] < uniform
+    assert history["val_loss"][-1] < 0.75 * uniform

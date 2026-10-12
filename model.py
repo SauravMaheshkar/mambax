@@ -9,7 +9,7 @@ from huggingface_hub import hf_hub_download
 from jaxtyping import Array, Float, Int
 from safetensors import safe_open
 
-from configs.default import Config
+from configs.default import Block, Config
 
 
 def dt_kernel_init(dt_rank: int) -> nnx.Initializer:
@@ -230,45 +230,233 @@ class MambaBlock(nnx.Module):
         return y + u * D
 
 
-class ResidualBlock(nnx.Module):
+def _segment_sums(a: Float[Array, "... chunk"]) -> Float[Array, "... chunk chunk"]:
+    """out[..., t, s] = a[s+1] + ... + a[t] for s <= t, and -inf above the diagonal.
+
+    exp() of it is the decay from step s to step t within a chunk. Summing masked
+    copies, instead of subtracting cumulative sums, keeps long chunks accurate.
+    """
+    length = a.shape[-1]
+    below = jnp.tril(jnp.ones((length, length), bool), -1)
+    sums = jnp.cumsum(jnp.where(below, a[..., :, None], 0.0), axis=-2)
+    return jnp.where(jnp.tril(jnp.ones((length, length), bool)), sums, -jnp.inf)
+
+
+class GatedRMSNorm(nnx.Module):
+    """RMSNorm(y * silu(z)) per group of channels, Mamba-2's norm before out_proj."""
+
+    def __init__(self, num_features: int, *, num_groups: int, epsilon: float, dtype):
+        self.num_groups = num_groups
+        self.epsilon = epsilon
+        self.dtype = dtype
+        self.scale = nnx.Param(jnp.ones(num_features))
+
+    def __call__(
+        self, y: Float[Array, "... hidden"], z: Float[Array, "... hidden"]
+    ) -> Float[Array, "... hidden"]:
+        f32 = jnp.float32
+        gated = y.astype(f32) * nnx.silu(z.astype(f32))
+        groups = rearrange(gated, "... (g d) -> ... g d", g=self.num_groups)
+        groups = groups * jax.lax.rsqrt(
+            jnp.mean(groups**2, axis=-1, keepdims=True) + self.epsilon
+        )
+        normed = rearrange(groups, "... g d -> ... (g d)") * self.scale[...]
+        return normed.astype(self.dtype)
+
+
+class Mamba2Block(nnx.Module):
+    """Mamba-2 block (Dao & Gu, 2024): a scalar decay per head turns the scan into
+    matmuls within chunks (SSD), which suits tensor cores and TPU MXUs.
+
+        in_proj -> z | x B C | dt
+        x B C -> causal depthwise conv -> silu
+        y = SSD(x, dt, A, B, C) + D x       (heads of head_dim channels)
+        out_proj(RMSNorm(y * silu(z)))
+    """
+
     def __init__(
         self,
         *,
         model_dim: int,
         hidden_dim: int,
         conv_dim: int,
-        dt_rank: int,
         state_dim: int,
+        head_dim: int,
+        num_groups: int,
         use_bias: bool = False,
         conv_bias: bool = True,
         norm_eps: float = 1e-5,
-        scan_chunk_size: int = 32,
+        scan_chunk_size: int = 256,
         dtype: jnp.dtype = jnp.float32,
         rngs: nnx.Rngs,
     ):
         super().__init__()
+        if hidden_dim % head_dim:
+            raise ValueError(
+                f"hidden_dim ({hidden_dim}) must be a multiple of head_dim ({head_dim})"
+            )
+        num_heads = hidden_dim // head_dim
+        if num_heads % num_groups:
+            raise ValueError(
+                f"num_heads ({num_heads}) must be a multiple of num_groups ({num_groups})"
+            )
 
         self.model_dim = model_dim
         self.hidden_dim = hidden_dim
         self.conv_dim = conv_dim
-        self.dt_rank = dt_rank
         self.state_dim = state_dim
-        self.use_bias = use_bias
-        self.conv_bias = conv_bias
+        self.head_dim = head_dim
+        self.num_heads = num_heads
+        self.num_groups = num_groups
+        self.scan_chunk_size = scan_chunk_size
 
-        self.mixer = MambaBlock(
-            model_dim=model_dim,
-            hidden_dim=hidden_dim,
-            conv_dim=conv_dim,
-            dt_rank=dt_rank,
-            state_dim=state_dim,
+        conv_channels = hidden_dim + 2 * num_groups * state_dim
+        self.in_proj = nnx.Linear(
+            in_features=model_dim,
+            out_features=hidden_dim + conv_channels + num_heads,
             use_bias=use_bias,
-            conv_bias=conv_bias,
-            scan_chunk_size=scan_chunk_size,
+            dtype=dtype,
+            rngs=rngs,
+        )
+        self.conv1d = nnx.Conv(
+            in_features=conv_channels,
+            out_features=conv_channels,
+            use_bias=conv_bias,
+            kernel_size=conv_dim,
+            feature_group_count=conv_channels,
+            padding=((conv_dim - 1, 0),),
+            dtype=dtype,
+            rngs=rngs,
+        )
+        self.dt_bias = nnx.Param(dt_bias_init()(rngs.params(), (num_heads,)))
+        # Decay rates A = -exp(A_log) spread uniformly over [1, 16], as in Mamba-2.
+        self.A_log = nnx.Param(
+            jnp.log(jax.random.uniform(rngs.params(), (num_heads,), minval=1, maxval=16))
+        )
+        self.D = nnx.Param(jnp.ones(num_heads))
+        self.norm = GatedRMSNorm(
+            hidden_dim, num_groups=num_groups, epsilon=norm_eps, dtype=dtype
+        )
+        self.out_proj = nnx.Linear(
+            in_features=hidden_dim,
+            out_features=model_dim,
+            use_bias=use_bias,
             dtype=dtype,
             rngs=rngs,
         )
 
+    @jax.named_scope("mamba2_block")
+    def __call__(
+        self, u: Float[Array, "batch seq model_dim"]
+    ) -> Float[Array, "batch seq model_dim"]:
+        conv_channels = self.hidden_dim + 2 * self.num_groups * self.state_dim
+        z, xBC, dt = jnp.split(
+            self.in_proj(u), [self.hidden_dim, self.hidden_dim + conv_channels], axis=-1
+        )
+        xBC = nnx.silu(self.conv1d(xBC))
+        x, B, C = jnp.split(
+            xBC,
+            [self.hidden_dim, self.hidden_dim + self.num_groups * self.state_dim],
+            axis=-1,
+        )
+
+        # Like the Mamba-1 scan, the recurrence and Δ run in float32.
+        f32 = jnp.float32
+        x = rearrange(x, "b l (h p) -> b l h p", p=self.head_dim).astype(f32)
+        B, C = (
+            rearrange(t, "b l (g n) -> b l g n", g=self.num_groups).astype(f32)
+            for t in (B, C)
+        )
+        dt = nnx.softplus(dt.astype(f32) + self.dt_bias[...])
+        A = -jnp.exp(self.A_log[...])
+
+        y = self.ssd(x, dt, A, B, C, chunk_size=self.scan_chunk_size)
+        y = y + x * self.D[...][:, None]
+        # The norm takes float32 y and returns the compute dtype for out_proj.
+        y = rearrange(y, "b l h p -> b l (h p)")
+        return self.out_proj(self.norm(y, z))
+
+    @staticmethod
+    def ssd(
+        x: Float[Array, "batch seq heads head_dim"],
+        dt: Float[Array, "batch seq heads"],
+        A: Float[Array, " heads"],
+        B: Float[Array, "batch seq groups state_dim"],
+        C: Float[Array, "batch seq groups state_dim"],
+        chunk_size: int,
+    ) -> Float[Array, "batch seq heads head_dim"]:
+        """The state space duality (SSD) form of the per-head scalar-decay SSM.
+
+        h_t = exp(Δ_t A) h_{t-1} + Δ_t x_t B_t^T     (h: head_dim x state_dim)
+        y_t = h_t C_t
+
+        Within a chunk the recurrence unrolls into masked attention-like matmuls,
+        y = (C B^T ∘ decay) (Δ x), quadratic in the chunk length. Chunks then hand
+        their final state to the next, as in the Mamba-1 chunked scan, and are
+        recomputed in the backward pass so memory stays ~one chunk:
+
+                 chunk 0             chunk 1
+              [matmuls in c]      [matmuls in c]
+            h=0 ------+-----> h_c -----+-----> h_2c ...
+        """
+        batch, seq_len, heads, _ = x.shape
+        groups = B.shape[2]
+        # Head i reads the B and C of group i // (heads / groups).
+        B, C = (jnp.repeat(t, heads // groups, axis=2) for t in (B, C))
+        # Padded steps have Δ = 0: no decay and no input, so they change nothing
+        # and their outputs are sliced off.
+        pad = -seq_len % chunk_size
+        chunks = tuple(
+            rearrange(
+                jnp.pad(t, ((0, 0), (0, pad)) + ((0, 0),) * (t.ndim - 2)),
+                "b (c l) ... -> c b l ...",
+                l=chunk_size,
+            )
+            for t in (x, dt, B, C)
+        )
+
+        @jax.checkpoint
+        def ssd_chunk(h, chunk):
+            x_c, dt_c, B_c, C_c = chunk
+            log_decay = rearrange(dt_c * A, "b l h -> b h l")
+            cumulative = jnp.cumsum(log_decay, axis=-1)
+            x_dt = x_c * dt_c[..., None]
+
+            # Within the chunk: y_t = sum_{s <= t} C_t.B_s decay(s -> t) Δ_s x_s.
+            decay = jnp.exp(_segment_sums(log_decay))
+            y = einsum(
+                C_c, B_c, decay, x_dt, "b t h n, b s h n, b h t s, b s h p -> b t h p"
+            )
+            # From the carried state: y_t += decay(start -> t) h C_t.
+            y = y + einsum(
+                C_c, h, jnp.exp(cumulative), "b t h n, b h p n, b h t -> b t h p"
+            )
+            # Carry: decay the state through the chunk and add what it absorbed.
+            to_end = jnp.exp(cumulative[..., -1:] - cumulative)
+            h = h * jnp.exp(cumulative[..., -1])[..., None, None] + einsum(
+                B_c, to_end, x_dt, "b s h n, b h s, b s h p -> b h p n"
+            )
+            return h, y
+
+        h0 = jnp.zeros((batch, heads, x.shape[-1], B.shape[-1]), x.dtype)
+        _, y = jax.lax.scan(ssd_chunk, h0, chunks)
+        return rearrange(y, "c b l h p -> b (c l) h p")[:, :seq_len]
+
+
+class ResidualBlock(nnx.Module):
+    """Pre-norm residual around a mixer (a Mamba-1 or Mamba-2 block)."""
+
+    def __init__(
+        self,
+        mixer: "MambaBlock | Mamba2Block",
+        *,
+        model_dim: int,
+        norm_eps: float = 1e-5,
+        dtype: jnp.dtype = jnp.float32,
+        rngs: nnx.Rngs,
+    ):
+        super().__init__()
+        self.mixer = mixer
         self.norm = nnx.RMSNorm(
             num_features=model_dim, epsilon=norm_eps, dtype=dtype, rngs=rngs
         )
@@ -291,6 +479,9 @@ class Mamba(nnx.Module):
         dt_rank: int,
         state_dim: int,
         num_layers: int,
+        block: Block = Block.MAMBA1,
+        head_dim: int = 64,
+        num_groups: int = 1,
         use_bias: bool = False,
         conv_bias: bool = True,
         norm_eps: float = 1e-5,
@@ -307,6 +498,7 @@ class Mamba(nnx.Module):
         self.dt_rank = dt_rank
         self.state_dim = state_dim
         self.num_layers = num_layers
+        self.block = block
         self.use_bias = use_bias
         self.conv_bias = conv_bias
 
@@ -317,18 +509,43 @@ class Mamba(nnx.Module):
             rngs=rngs,
         )
 
+        def mixer() -> MambaBlock | Mamba2Block:
+            match block:
+                case Block.MAMBA1:
+                    return MambaBlock(
+                        model_dim=model_dim,
+                        hidden_dim=hidden_dim,
+                        conv_dim=conv_dim,
+                        dt_rank=dt_rank,
+                        state_dim=state_dim,
+                        use_bias=use_bias,
+                        conv_bias=conv_bias,
+                        scan_chunk_size=scan_chunk_size,
+                        dtype=dtype,
+                        rngs=rngs,
+                    )
+                case Block.MAMBA2:
+                    return Mamba2Block(
+                        model_dim=model_dim,
+                        hidden_dim=hidden_dim,
+                        conv_dim=conv_dim,
+                        state_dim=state_dim,
+                        head_dim=head_dim,
+                        num_groups=num_groups,
+                        use_bias=use_bias,
+                        conv_bias=conv_bias,
+                        norm_eps=norm_eps,
+                        scan_chunk_size=scan_chunk_size,
+                        dtype=dtype,
+                        rngs=rngs,
+                    )
+
         self.layers = nnx.List(
             [
                 ResidualBlock(
+                    mixer(),
                     model_dim=model_dim,
-                    hidden_dim=hidden_dim,
-                    conv_dim=conv_dim,
-                    dt_rank=dt_rank,
-                    state_dim=state_dim,
-                    use_bias=use_bias,
-                    conv_bias=conv_bias,
                     norm_eps=norm_eps,
-                    scan_chunk_size=scan_chunk_size,
                     dtype=dtype,
                     rngs=rngs,
                 )
@@ -350,6 +567,9 @@ class Mamba(nnx.Module):
             dt_rank=config.resolved_dt_rank,
             state_dim=config.state_dim,
             num_layers=config.num_layers,
+            block=config.block,
+            head_dim=config.head_dim,
+            num_groups=config.num_groups,
             use_bias=config.use_bias,
             conv_bias=config.conv_bias,
             norm_eps=config.norm_eps,

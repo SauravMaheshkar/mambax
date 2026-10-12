@@ -8,6 +8,11 @@ class Dataset(enum.StrEnum):
     FINEWEB = "fineweb"
 
 
+class Block(enum.StrEnum):
+    MAMBA1 = "mamba1"
+    MAMBA2 = "mamba2"
+
+
 class Dtype(enum.StrEnum):
     FLOAT32 = "float32"
     BFLOAT16 = "bfloat16"
@@ -67,8 +72,15 @@ class Config:
     conv_dim: int = 4
     # dt rank, None for Mamba's default of ceil(model_dim / 16)
     dt_rank: int | None = None
+    # mixer: Mamba-1 (selective scan, per-channel decay) or Mamba-2 (SSD, per-head
+    # decay, matmul-friendly; usually run with a larger state_dim like 64-128)
+    block: Block = Block.MAMBA1
     # state dimension
     state_dim: int = 16
+    # Mamba-2 only: channels per head (hidden_dim must be a multiple of it)
+    head_dim: int = 64
+    # Mamba-2 only: groups of heads sharing B and C
+    num_groups: int = 1
     # expand factor
     expand: int = 2
     # pad vocab size multiple
@@ -79,7 +91,7 @@ class Config:
     conv_bias: bool = True
     # RMSNorm epsilon
     norm_eps: float = 1e-5
-    # sequence chunk length for the memory-bounded selective scan
+    # sequence chunk length for the memory-bounded scan (Mamba-1) or SSD (Mamba-2)
     scan_chunk_size: int = 32
     # dtype of matmuls and convolutions; params, the residual stream, the scan and
     # the loss stay float32. bfloat16 is for accelerators, CPUs emulate it slowly.
