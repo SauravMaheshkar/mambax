@@ -1,5 +1,4 @@
 import os
-import shutil
 
 import jax
 from absl import app, flags, logging
@@ -37,9 +36,6 @@ def main(argv):
         platform.ArtifactType.DIRECTORY, FLAGS.workdir, "workdir"
     )
 
-    if os.path.exists(FLAGS.workdir):
-        logging.info(f"Workdir {FLAGS.workdir} already exists. Deleting...")
-        shutil.rmtree(FLAGS.workdir)
     os.makedirs(FLAGS.workdir, exist_ok=True)
 
     train.train_and_evaluate(FLAGS.config, FLAGS.workdir)

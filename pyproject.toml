@@ -13,6 +13,7 @@ dependencies = [
     "huggingface-hub>=2.1.1",
     "jaxtyping>=0.3.2",
     "ml-collections>=1.1.0",
+    "orbax-checkpoint>=0.12.7",
     "safetensors>=0.8.0",
 ]
 

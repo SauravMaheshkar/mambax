@@ -343,33 +343,7 @@ class Mamba(nnx.Module):
 
     @property
     def num_params(self) -> int:
-        return sum(p.size for p in jax.tree.leaves(self.state))
-
-    @property
-    def state(self) -> nnx.State:
-        """Splits state from the graph and returns it"""
-        return nnx.split(self, nnx.Param, ...)[1]
-
-    @property
-    def state_dict(self) -> dict[str, Array]:
-        """Splits state from the graph and returns it as a dictionary.
-
-        It can be used for serialization with orbax."""
-        state = self.state
-        pure_dict_state = nnx.to_pure_dict(state)
-        return pure_dict_state
-
-    def save(self, path: str, **kwargs) -> None:
-        """Saves the model state to a directory.
-
-        Args:
-            path: The directory path to save the model state to.
-        """
-        import orbax.checkpoint as ocp
-
-        state = nnx.state(self)
-        checkpointer = ocp.PyTreeCheckpointer()
-        checkpointer.save(f"{path}/mamba", state, **kwargs)
+        return sum(p.size for p in jax.tree.leaves(nnx.state(self, nnx.Param)))
 
     @classmethod
     def from_pretrained(
@@ -428,19 +402,6 @@ class Mamba(nnx.Module):
 
         nnx.update(model, nnx.State.from_flat_path(loaded))
         return model
-
-    def load(self, path: str) -> "Mamba":
-        """Loads the model state from a directory.
-
-        Args:
-            path: The directory path to load the model state from.
-        """
-        import orbax.checkpoint as ocp
-
-        checkpointer = ocp.PyTreeCheckpointer()
-        state = checkpointer.restore(f"{path}/mamba", item=nnx.state(self))
-        nnx.update(self, state)
-        return self
 
 
 def _hf_to_nnx(key: str, tensor: Array) -> tuple[PathParts, Array]:

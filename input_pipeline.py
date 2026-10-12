@@ -91,17 +91,22 @@ def num_train_batches(
 
 
 def train_batches(
-    shards: Sequence[TokenStream], batch_size: int, sequence_length: int
+    shards: Sequence[TokenStream],
+    batch_size: int,
+    sequence_length: int,
+    first_batch: int = 0,
 ) -> Iterator[Batch]:
     """Consecutive batches over the shards read as one stream, until it runs out.
 
     Batch k covers stream tokens [k*B*L, (k+1)*B*L], the extra token being the
     last target. Rows are consecutive L-token windows, so no token is skipped
-    or repeated, including across shard boundaries.
+    or repeated, including across shard boundaries. Starting at `first_batch`
+    yields exactly the batches a full pass would yield from there, which is all
+    a resumed run needs to pick up the stream where it left off.
     """
     offsets = np.cumsum([0, *(len(shard) for shard in shards)])
     step = batch_size * sequence_length
-    for start in range(0, int(offsets[-1]) - step, step):
+    for start in range(first_batch * step, int(offsets[-1]) - step, step):
         window = _read(shards, offsets, start, start + step + 1)
         yield _to_batch(window, batch_size, sequence_length)
 
