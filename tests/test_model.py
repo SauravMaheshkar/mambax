@@ -9,8 +9,8 @@ from flax import nnx
 from huggingface_hub import hf_hub_download
 from safetensors import safe_open
 
-from configs.default import Config, Dtype
-from model import Mamba, MambaBlock, dt_bias_init
+from configs.default import Block, Config, Dtype
+from model import Mamba, Mamba2Block, MambaBlock, dt_bias_init
 
 
 PRETRAINED_REPO = "state-spaces/mamba-130m-hf"
@@ -19,6 +19,21 @@ PRETRAINED_REPO = "state-spaces/mamba-130m-hf"
 @pytest.fixture(scope="module")
 def tiny_model() -> Mamba:
     config = Config(vocab_size=64, model_dim=16, num_layers=2, state_dim=4)
+    return Mamba.from_config(config, rngs=nnx.Rngs(0))
+
+
+@pytest.fixture(scope="module")
+def tiny_mamba2() -> Mamba:
+    config = Config(
+        vocab_size=64,
+        model_dim=16,
+        num_layers=2,
+        state_dim=4,
+        block=Block.MAMBA2,
+        head_dim=8,
+        num_groups=2,
+        scan_chunk_size=8,
+    )
     return Mamba.from_config(config, rngs=nnx.Rngs(0))
 
 
@@ -111,8 +126,10 @@ def test_scan_backward_memory_does_not_scale_with_state_sequence():
     assert long < 3 * short
 
 
+@pytest.mark.parametrize("model", ["tiny_model", "tiny_mamba2"])
 @pytest.mark.parametrize("position", [0, 5, 31])
-def test_model_is_causal(tiny_model: Mamba, position: int):
+def test_model_is_causal(model: str, position: int, request: pytest.FixtureRequest):
+    tiny_model: Mamba = request.getfixturevalue(model)
     tokens = jax.random.randint(jax.random.key(0), (2, 32), 0, tiny_model.vocab_size)
     perturbed = tokens.at[:, position].set(
         (tokens[:, position] + 1) % tiny_model.vocab_size
@@ -150,7 +167,9 @@ def test_dt_bias_init_clamps_to_floor():
 
 
 def test_dt_proj_uses_mamba_init(tiny_model: Mamba):
-    dt_proj = tiny_model.layers[0].mixer.dt_proj
+    mixer = tiny_model.layers[0].mixer
+    assert isinstance(mixer, MambaBlock)
+    dt_proj = mixer.dt_proj
     assert dt_proj.bias is not None
     dt = jax.nn.softplus(dt_proj.bias[...])
 
@@ -249,3 +268,150 @@ def test_bf16_logits_stay_close_to_float32(bf16_pair: tuple[Mamba, Mamba]):
     f32, bf16 = bf16_pair
     tokens = jax.random.randint(jax.random.key(0), (2, 64), 0, 64)
     np.testing.assert_allclose(bf16(tokens), f32(tokens), atol=5e-2, rtol=5e-2)
+
+
+def sequential_ssd(x, dt, A, B, C) -> np.ndarray:
+    """Step-by-step reference for Mamba-2's per-head scalar-decay recurrence."""
+    heads, groups = x.shape[2], B.shape[2]
+    B, C = (np.repeat(m, heads // groups, axis=2) for m in (B, C))
+    h = np.zeros((x.shape[0], heads, x.shape[-1], B.shape[-1]))
+    ys = []
+    for t in range(x.shape[1]):
+        decay = np.exp(dt[:, t] * A)[..., None, None]
+        h = decay * h + dt[:, t, :, None, None] * x[:, t, :, :, None] * B[:, t, :, None]
+        ys.append(np.einsum("bhpn,bhn->bhp", h, C[:, t]))
+    return np.stack(ys, axis=1)
+
+
+def ssd_inputs(batch: int, seq_len: int, heads: int, groups: int, seed: int = 0):
+    head_dim, state = 3, 5
+    keys = jax.random.split(jax.random.key(seed), 5)
+    return (
+        jax.random.normal(keys[0], (batch, seq_len, heads, head_dim)),
+        jax.nn.softplus(jax.random.normal(keys[1], (batch, seq_len, heads))),
+        -jnp.exp(jax.random.normal(keys[2], (heads,))),
+        jax.random.normal(keys[3], (batch, seq_len, groups, state)),
+        jax.random.normal(keys[4], (batch, seq_len, groups, state)),
+    )
+
+
+@pytest.mark.parametrize("groups", [1, 2, 4])
+@pytest.mark.parametrize(
+    ("seq_len", "chunk_size"),
+    [(1, 1), (1, 32), (2, 1), (7, 3), (64, 1), (64, 7), (64, 32), (64, 64), (64, 100)],
+)
+def test_ssd_matches_sequential_reference(seq_len: int, chunk_size: int, groups: int):
+    inputs = ssd_inputs(batch=2, seq_len=seq_len, heads=4, groups=groups, seed=seq_len)
+
+    actual = Mamba2Block.ssd(*inputs, chunk_size=chunk_size)
+    expected = sequential_ssd(*map(np.asarray, inputs))
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("chunk_size", [1, 5, 16])
+def test_chunked_ssd_gradients_match_single_chunk(chunk_size: int):
+    inputs = ssd_inputs(batch=2, seq_len=48, heads=4, groups=2)
+
+    def loss(chunk: int):
+        return lambda *args: jnp.sum(Mamba2Block.ssd(*args, chunk_size=chunk) ** 2)
+
+    argnums = tuple(range(len(inputs)))
+    expected = jax.grad(loss(48), argnums=argnums)(*inputs)
+    actual = jax.grad(loss(chunk_size), argnums=argnums)(*inputs)
+
+    for a, e in zip(actual, expected):
+        np.testing.assert_allclose(a, e, rtol=1e-4, atol=1e-5)
+
+
+def ssd_backward_temp_bytes(seq_len: int, batch: int, heads: int) -> int:
+    inputs = ssd_inputs(batch, seq_len, heads, groups=1)
+
+    def loss(*args):
+        return jnp.sum(Mamba2Block.ssd(*args, chunk_size=64))
+
+    grad = jax.jit(jax.grad(loss, argnums=tuple(range(len(inputs)))))
+    memory = grad.lower(*inputs).compile().memory_analysis()
+    assert memory is not None
+    return memory.temp_size_in_bytes
+
+
+def test_ssd_backward_memory_is_linear_in_sequence_length():
+    """Regression guard: one chunk over the whole sequence is quadratic, the
+    (batch, heads, seq, seq) decay matrix alone is 537MB at seq 4096 here."""
+    batch, heads = 2, 4
+    one_decay_matrix = batch * heads * 4096 * 4096 * 4
+
+    short = ssd_backward_temp_bytes(1024, batch, heads)
+    long = ssd_backward_temp_bytes(4096, batch, heads)
+
+    assert long < 0.05 * one_decay_matrix
+    assert long < 5 * short
+
+
+def test_mamba2_init(tiny_mamba2: Mamba):
+    mixer = tiny_mamba2.layers[0].mixer
+    assert isinstance(mixer, Mamba2Block)
+    assert mixer.num_heads == 4
+    A = np.exp(np.asarray(mixer.A_log[...]))
+    assert np.all((A >= 1) & (A <= 16))
+    dt = jax.nn.softplus(mixer.dt_bias[...])
+    assert jnp.all((dt >= 1e-3 * (1 - 1e-4)) & (dt <= 1e-1 * (1 + 1e-4)))
+    np.testing.assert_array_equal(mixer.D[...], 1.0)
+    conv_channels = mixer.hidden_dim + 2 * mixer.num_groups * mixer.state_dim
+    assert mixer.conv1d.kernel.shape == (mixer.conv_dim, 1, conv_channels)
+
+
+@pytest.mark.parametrize(
+    ("hidden_multiple", "head_dim", "num_groups", "match"),
+    [(1, 24, 1, "multiple of head_dim"), (1, 8, 3, "multiple of num_groups")],
+)
+def test_mamba2_rejects_uneven_heads(
+    hidden_multiple: int, head_dim: int, num_groups: int, match: str
+):
+    config = Config(
+        vocab_size=64,
+        model_dim=16,
+        num_layers=1,
+        block=Block.MAMBA2,
+        head_dim=head_dim,
+        num_groups=num_groups,
+    )
+    with pytest.raises(ValueError, match=match):
+        Mamba.from_config(config, rngs=nnx.Rngs(0))
+
+
+def test_mamba2_bf16_keeps_ssd_in_float32_and_stays_close(tiny_mamba2: Mamba):
+    config = Config(
+        vocab_size=64,
+        model_dim=16,
+        num_layers=2,
+        state_dim=4,
+        block=Block.MAMBA2,
+        head_dim=8,
+        num_groups=2,
+        scan_chunk_size=8,
+        compute_dtype=Dtype.BFLOAT16,
+    )
+    bf16 = Mamba.from_config(config, rngs=nnx.Rngs(0))
+    tokens = jax.random.randint(jax.random.key(0), (2, 64), 0, 64)
+
+    graphdef, state = nnx.split(bf16)
+    jaxpr = jax.make_jaxpr(lambda s, x: nnx.merge(graphdef, s)(x))(state, tokens)
+    equations = list(all_equations(jaxpr.jaxpr))
+    scan_dtypes = {
+        v.aval.dtype for e in equations if e.primitive.name == "scan" for v in e.outvars
+    }
+    matmul_dtypes = {
+        v.aval.dtype
+        for e in equations
+        if e.primitive.name == "dot_general"
+        for v in e.invars
+    }
+    assert scan_dtypes == {jnp.dtype(jnp.float32)}
+    assert jnp.dtype(jnp.bfloat16) in matmul_dtypes
+    # bf16 noise, ~1% of the logits on average (Δ comes out of a bf16 in_proj, as in
+    # mamba_ssm under autocast); a layout or precision bug is far larger.
+    error = np.abs(np.asarray(bf16(tokens)) - np.asarray(tiny_mamba2(tokens)))
+    assert error.mean() < 0.02
+    assert error.max() < 0.2

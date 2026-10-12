@@ -33,6 +33,18 @@ python main.py --workdir=artifacts/ \
     --config.val_tokens=10485760
 ```
 
+Train a Mamba-2 model instead: its SSD layer has one decay rate per head, which turns
+the scan into matmuls within chunks (fast on tensor cores and TPUs), and it usually runs
+with a much larger state
+
+```shell
+python main.py --workdir=artifacts/ \
+    --config.block=mamba2 \
+    --config.state_dim=128 \
+    --config.head_dim=64 \
+    --config.scan_chunk_size=256
+```
+
 Training is data parallel over every local device (e.g. the 8 chips of a TPU v5e-8):
 params are replicated and each batch is split across devices. On accelerators, run the
 matmuls in bfloat16 (params, the residual stream, the scan and the loss stay float32), and
