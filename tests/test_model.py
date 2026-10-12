@@ -1,4 +1,7 @@
+import dataclasses
+
 import jax
+import jax.extend
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -6,7 +9,7 @@ from flax import nnx
 from huggingface_hub import hf_hub_download
 from safetensors import safe_open
 
-from configs.default import Config
+from configs.default import Config, Dtype
 from model import Mamba, MambaBlock, dt_bias_init
 
 
@@ -181,3 +184,68 @@ def test_pretrained_copies_in_context(pretrained_model: Mamba):
     accuracy = (predictions[:, half:-1] == sequence[:, half + 1 :]).mean()
 
     assert accuracy > 0.8
+
+
+def all_equations(jaxpr: jax.extend.core.Jaxpr):
+    """Every equation, including those inside scans, remat and nested jits."""
+    for eqn in jaxpr.eqns:
+        yield eqn
+        for param in eqn.params.values():
+            for sub in param if isinstance(param, (tuple, list)) else [param]:
+                if isinstance(sub, jax.extend.core.ClosedJaxpr):
+                    yield from all_equations(sub.jaxpr)
+                elif isinstance(sub, jax.extend.core.Jaxpr):
+                    yield from all_equations(sub)
+
+
+@pytest.fixture(scope="module")
+def bf16_pair() -> tuple[Mamba, Mamba]:
+    """The same weights in float32 and with bfloat16 compute."""
+    config = Config(vocab_size=64, model_dim=16, num_layers=2, state_dim=4)
+    bf16 = dataclasses.replace(config, compute_dtype=Dtype.BFLOAT16)
+    return (
+        Mamba.from_config(config, rngs=nnx.Rngs(0)),
+        Mamba.from_config(bf16, rngs=nnx.Rngs(0)),
+    )
+
+
+def test_bf16_keeps_float32_params_and_logits(bf16_pair: tuple[Mamba, Mamba]):
+    _, bf16 = bf16_pair
+    params = jax.tree.leaves(nnx.state(bf16, nnx.Param))
+    assert {p.dtype for p in params} == {jnp.dtype(jnp.float32)}
+    assert bf16(jnp.zeros((1, 8), jnp.int32)).dtype == jnp.float32
+
+
+def test_bf16_runs_matmuls_in_bf16_and_keeps_the_recurrence_in_float32(
+    bf16_pair: tuple[Mamba, Mamba],
+):
+    _, bf16 = bf16_pair
+    graphdef, state = nnx.split(bf16)
+    jaxpr = jax.make_jaxpr(lambda s, x: nnx.merge(graphdef, s)(x))(
+        state, jnp.zeros((1, 8), jnp.int32)
+    )
+    equations = list(all_equations(jaxpr.jaxpr))
+
+    def dtypes(primitive: str, out_shape: tuple[int, ...] | None = None) -> set:
+        return {
+            v.aval.dtype
+            for e in equations
+            if e.primitive.name == primitive
+            and (out_shape is None or e.outvars[0].aval.shape == out_shape)
+            for v in (*e.invars, *e.outvars)
+            if hasattr(v.aval, "dtype")
+        }
+
+    f32, bf16_dtype = jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16)
+    # model_dim=16, hidden_dim=32, batch 1, seq 8.
+    assert bf16_dtype in dtypes("dot_general", (1, 8, 64)), "in_proj"
+    assert bf16_dtype in dtypes("dot_general", (1, 8, 16)), "out_proj"
+    assert dtypes("dot_general", (1, 8, 32)) == {f32}, "dt_proj"
+    assert dtypes("scan") == {f32}, "selective scan"
+    assert dtypes("add", (1, 8, 16)) == {f32}, "residual stream"
+
+
+def test_bf16_logits_stay_close_to_float32(bf16_pair: tuple[Mamba, Mamba]):
+    f32, bf16 = bf16_pair
+    tokens = jax.random.randint(jax.random.key(0), (2, 64), 0, 64)
+    np.testing.assert_allclose(bf16(tokens), f32(tokens), atol=5e-2, rtol=5e-2)

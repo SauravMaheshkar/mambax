@@ -202,7 +202,9 @@ def load_model(workdir: str) -> Mamba:
             raise FileNotFoundError(f"no checkpoints in {workdir}")
         saved = _restore_config(checkpoints, step)
         config = dataclasses.replace(
-            default.Config(**saved), dataset=default.Dataset(saved["dataset"])
+            default.Config(**saved),
+            dataset=default.Dataset(saved["dataset"]),
+            compute_dtype=default.Dtype(saved["compute_dtype"]),
         )
         # Every weight gets overwritten, so skip the random init.
         model = nnx.eval_shape(lambda: Mamba.from_config(config, rngs=nnx.Rngs(0)))

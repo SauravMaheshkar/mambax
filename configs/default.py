@@ -8,6 +8,11 @@ class Dataset(enum.StrEnum):
     FINEWEB = "fineweb"
 
 
+class Dtype(enum.StrEnum):
+    FLOAT32 = "float32"
+    BFLOAT16 = "bfloat16"
+
+
 # Field types stick to what ml_collections can parse from the command line:
 # plain scalars, Optional scalars and enums (Literal and non-Optional unions fail).
 @dataclasses.dataclass
@@ -73,6 +78,9 @@ class Config:
     norm_eps: float = 1e-5
     # sequence chunk length for the memory-bounded selective scan
     scan_chunk_size: int = 32
+    # dtype of matmuls and convolutions; params, the residual stream, the scan and
+    # the loss stay float32. bfloat16 is for accelerators, CPUs emulate it slowly.
+    compute_dtype: Dtype = Dtype.FLOAT32
     # whether to use weights and biases
     use_wandb: bool = False
     # weights and biases project
