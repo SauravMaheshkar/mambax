@@ -49,6 +49,9 @@ from configs.default import Dataset
 
 TokenStream = Int[np.ndarray, " tokens"]
 Batch = tuple[Int[np.ndarray, "batch seq"], Int[np.ndarray, "batch seq"]]
+Microbatches = tuple[
+    Int[np.ndarray, "accum micro seq"], Int[np.ndarray, "accum micro seq"]
+]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -130,6 +133,12 @@ def eval_batches(
         _to_batch(val[start : start + step + 1], batch_size, sequence_length)
         for start in range(0, val_tokens, step)
     )
+
+
+def split_microbatches(batch: Batch, num_microbatches: int) -> Microbatches:
+    """Consecutive groups of rows, e.g. rows [0, B/n) form the first microbatch."""
+    inputs, targets = (x.reshape(num_microbatches, -1, x.shape[-1]) for x in batch)
+    return inputs, targets
 
 
 def _read(

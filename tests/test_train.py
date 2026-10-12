@@ -1,5 +1,6 @@
 import dataclasses
 import math
+import os
 import shutil
 import signal
 import subprocess
@@ -14,13 +15,15 @@ import pytest
 from flax import nnx
 
 from configs.default import Config, Dtype
-from input_pipeline import TINYSTORIES_VOCAB_SIZE
+from input_pipeline import TINYSTORIES_VOCAB_SIZE, split_microbatches
 from model import Mamba
 from train import (
     CHECKPOINT_DIR,
+    check_batch_layout,
     load_model,
     make_optimizer,
     train_and_evaluate,
+    train_step,
     weight_decay_mask,
 )
 
@@ -62,6 +65,15 @@ def checkpoint_steps(workdir: Path) -> list[int]:
     if not checkpoints.exists():
         return []
     return sorted(int(path.name) for path in checkpoints.iterdir() if path.name.isdigit())
+
+
+def cli_overrides(config: Config) -> list[str]:
+    """main.py flags that reproduce `config`."""
+    return [
+        f"--config.{field.name}={getattr(config, field.name)}"
+        for field in dataclasses.fields(Config)
+        if getattr(config, field.name) != field.default
+    ]
 
 
 def assert_same_params(a: Mamba, b: Mamba):
@@ -142,13 +154,8 @@ def test_resuming_a_killed_process_matches_an_uninterrupted_run(run, tmp_path: P
     """
     _, workdir = run
     killed = dataclasses.replace(SMALL, n_freq_checkpoint=1)
-    overrides = [
-        f"--config.{field.name}={getattr(killed, field.name)}"
-        for field in dataclasses.fields(Config)
-        if getattr(killed, field.name) != field.default
-    ]
     trainer = subprocess.Popen(
-        [sys.executable, "main.py", f"--workdir={tmp_path}", *overrides],
+        [sys.executable, "main.py", f"--workdir={tmp_path}", *cli_overrides(killed)],
         cwd=Path(__file__).parents[1],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -245,6 +252,123 @@ def test_learning_rate_warms_up_from_zero(tiny_model: Mamba):
     for before, first, second in zip(initial, after_first, after_second):
         np.testing.assert_array_equal(first, before)
         assert not np.array_equal(second, first)
+
+
+@pytest.mark.parametrize("grad_accum_steps", [2, 4, 16])
+def test_grad_accumulation_matches_a_full_batch_step(grad_accum_steps: int):
+    config = dataclasses.replace(SMALL, vocab_size=TINYSTORIES_VOCAB_SIZE)
+    tokens = np.random.default_rng(0).integers(
+        0, TINYSTORIES_VOCAB_SIZE, (config.batch_size, config.sequence_length + 1)
+    )
+    batch = tokens[:, :-1], tokens[:, 1:]
+
+    def two_steps(num_microbatches: int) -> tuple[Mamba, float]:
+        # Two, since the first runs at the warmup's lr of 0.
+        model = Mamba.from_config(config, rngs=nnx.Rngs(0))
+        optimizer = make_optimizer(model, config)
+        metrics = nnx.MultiMetric(loss=nnx.metrics.Average("loss"))
+        for _ in range(2):
+            microbatches = split_microbatches(batch, num_microbatches)
+            train_step(model, optimizer, metrics, jax.device_put(microbatches))
+        return model, float(metrics.compute()["loss"])
+
+    full, full_loss = two_steps(1)
+    accumulated, accumulated_loss = two_steps(grad_accum_steps)
+
+    assert accumulated_loss == pytest.approx(full_loss, rel=1e-6)
+    for (path, a), (_, b) in zip(
+        nnx.state(accumulated, nnx.Param).flat_state(),
+        nnx.state(full, nnx.Param).flat_state(),
+    ):
+        np.testing.assert_allclose(
+            a[...], b[...], rtol=1e-5, atol=1e-6, err_msg=str(path)
+        )
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "grad_accum_steps", "num_devices", "match"),
+    [
+        (16, 3, 1, "multiple of grad_accum_steps"),
+        (16, 0, 1, "multiple of grad_accum_steps"),
+        (16, 32, 1, "multiple of grad_accum_steps"),
+        (16, 2, 3, "multiple of the number of devices \\(3\\)"),
+        (16, 4, 8, "multiple of the number of devices \\(8\\)"),
+    ],
+)
+def test_rejects_batches_that_dont_split_evenly(
+    batch_size: int, grad_accum_steps: int, num_devices: int, match: str
+):
+    config = dataclasses.replace(
+        SMALL, batch_size=batch_size, grad_accum_steps=grad_accum_steps
+    )
+    with pytest.raises(ValueError, match=match):
+        check_batch_layout(config, num_devices)
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "grad_accum_steps", "num_devices"),
+    [(16, 1, 1), (16, 2, 8), (16, 16, 1), (32, 4, 8)],
+)
+def test_accepts_batches_that_split_evenly(
+    batch_size: int, grad_accum_steps: int, num_devices: int
+):
+    config = dataclasses.replace(
+        SMALL, batch_size=batch_size, grad_accum_steps=grad_accum_steps
+    )
+    check_batch_layout(config, num_devices)
+
+
+def test_data_parallel_on_8_devices_matches_one_device(tmp_path: Path):
+    """8 CPU devices in a subprocess (the device count is fixed at JAX startup),
+    with gradient accumulation on top, against a 1-device run of the same config."""
+    short = dataclasses.replace(
+        SMALL,
+        n_iterations=20,
+        warmup_steps=5,
+        n_freq_train=10,
+        n_freq_eval=10,
+        n_freq_checkpoint=20,
+    )
+    one_device = tmp_path / "one_device"
+    one_history = train_and_evaluate(short, str(one_device))
+
+    eight_devices = tmp_path / "eight_devices"
+    sharded = dataclasses.replace(short, grad_accum_steps=2)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "main.py",
+            f"--workdir={eight_devices}",
+            "--logtostderr",
+            *cli_overrides(sharded),
+        ],
+        cwd=Path(__file__).parents[1],
+        env=os.environ | {"JAX_NUM_CPU_DEVICES": "8", "JAX_PLATFORMS": "cpu"},
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stderr[-3000:]
+    assert "Data parallel over 8 cpu devices" in result.stderr
+
+    val_losses = [
+        float(line.rsplit(" ", 1)[1])
+        for line in result.stdout.splitlines()
+        if "val_loss" in line
+    ]
+    # main.py prints losses to 4 decimals.
+    np.testing.assert_allclose(val_losses, one_history["val_loss"], atol=1e-4)
+    for (path, a), (_, b) in zip(
+        nnx.state(load_model(str(eight_devices)), nnx.Param).flat_state(),
+        nnx.state(load_model(str(one_device)), nnx.Param).flat_state(),
+    ):
+        np.testing.assert_allclose(
+            a[...], b[...], rtol=1e-4, atol=1e-5, err_msg=str(path)
+        )
+
+    # The 8-device checkpoint restores here too, on one device.
+    history = train_and_evaluate(sharded, str(eight_devices))
+    assert history == {"train_loss": [], "val_loss": []}
 
 
 def test_bf16_compute_learns(tmp_path: Path):
