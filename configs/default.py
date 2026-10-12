@@ -23,8 +23,11 @@ class Config:
     model_dim: int = 192
     # number of layers
     num_layers: int = 4
-    # batch size for training
+    # sequences per optimizer step, across all devices and accumulation steps
     batch_size: int = 16
+    # each step's batch is split into this many microbatches, run one after the
+    # other with their gradients summed, to cap activation memory
+    grad_accum_steps: int = 1
     # peak learning rate, reached after warmup_steps, then cosine-decayed to 0 at
     # n_iterations
     learning_rate: float = 1e-3
@@ -90,6 +93,10 @@ class Config:
 
     # Derived values are properties, not __post_init__ assignments, so that
     # command line overrides like --config.model_dim=256 propagate to them.
+
+    @property
+    def microbatch_size(self) -> int:
+        return self.batch_size // self.grad_accum_steps
 
     @property
     def hidden_dim(self) -> int:

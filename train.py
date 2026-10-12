@@ -5,11 +5,15 @@ import os
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 import orbax.checkpoint as ocp
 from absl import logging
 from flax import nnx
+from jax.sharding import AxisType, Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
+from jaxtyping import Array, Int
 
 from configs import default
 from input_pipeline import (
@@ -18,12 +22,14 @@ from input_pipeline import (
     eval_batches,
     load_data,
     num_train_batches,
+    split_microbatches,
     train_batches,
 )
 from model import Mamba
 
 
-Batch = tuple[jax.Array, jax.Array]
+Batch = tuple[Int[Array, "batch seq"], Int[Array, "batch seq"]]
+Microbatches = tuple[Int[Array, "accum micro seq"], Int[Array, "accum micro seq"]]
 
 CHECKPOINT_DIR = "checkpoints"
 # Fields that only change logging or checkpoint bookkeeping, so a run may resume
@@ -34,6 +40,8 @@ _RESUMABLE_FIELDS = frozenset(
         "n_freq_eval",
         "n_freq_checkpoint",
         "max_checkpoints_to_keep",
+        # Same global batch, same math, just a different memory/time trade-off.
+        "grad_accum_steps",
         "use_wandb",
         "wandb_project",
         "wandb_entity",
@@ -41,12 +49,11 @@ _RESUMABLE_FIELDS = frozenset(
 )
 
 
-def loss_fn(model: Mamba, batch: Batch) -> tuple[jax.Array, jax.Array]:
+def loss_fn(model: Mamba, batch: Batch) -> jax.Array:
     logits = model(batch[0])
-    loss = optax.softmax_cross_entropy_with_integer_labels(
+    return optax.softmax_cross_entropy_with_integer_labels(
         logits=logits, labels=batch[1]
     ).mean()
-    return loss, logits
 
 
 @nnx.jit
@@ -54,25 +61,69 @@ def train_step(
     model: Mamba,
     optimizer: nnx.Optimizer,
     metrics: nnx.MultiMetric,
-    batch: Batch,
+    microbatches: Microbatches,
 ):
-    grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
-    (loss, logits), grads = grad_fn(model, batch)
-    metrics.update(loss=loss, logits=logits, labels=batch[1])
+    """One optimizer step on the mean gradient over the microbatches.
+
+    The microbatches run one after another in a scan, so only one microbatch's
+    activations are alive at a time. Each has the same number of tokens, so the
+    mean of their gradients is the gradient of the whole batch.
+    """
+    graphdef, params, rest = nnx.split(model, nnx.Param, ...)
+
+    def microbatch_loss(params: nnx.State, batch: Batch) -> jax.Array:
+        return loss_fn(nnx.merge(graphdef, params, rest), batch)
+
+    def accumulate(totals, batch: Batch):
+        loss_and_grads = jax.value_and_grad(microbatch_loss)(params, batch)
+        return jax.tree.map(jnp.add, totals, loss_and_grads), None
+
+    zeros = jax.tree.map(jnp.zeros_like, (jnp.zeros(()), params))
+    totals, _ = jax.lax.scan(accumulate, zeros, microbatches)
+    loss, grads = jax.tree.map(lambda total: total / len(microbatches[0]), totals)
+    metrics.update(loss=loss)
     optimizer.update(model, grads)
 
 
 @nnx.jit
 def eval_step(model: Mamba, batch: Batch) -> jax.Array:
-    return loss_fn(model, batch)[0]
+    return loss_fn(model, batch)
 
 
-def evaluate(model: Mamba, val: TokenStream, config: default.Config) -> float:
+def evaluate(
+    model: Mamba, val: TokenStream, config: default.Config, sharding: NamedSharding
+) -> float:
     """Mean loss over the first `config.val_tokens` val targets, identical every call."""
     batches = eval_batches(
-        val, config.val_tokens, config.batch_size, config.sequence_length
+        val, config.val_tokens, config.microbatch_size, config.sequence_length
     )
-    return float(np.mean([eval_step(model, jax.device_put(batch)) for batch in batches]))
+    losses = [eval_step(model, jax.device_put(batch, sharding)) for batch in batches]
+    return float(np.mean(losses))
+
+
+def make_mesh() -> Mesh:
+    """A 1-D mesh over every device, for data parallelism.
+
+    Params and optimizer state are replicated, batches are split along their
+    batch axis, and XLA inserts the all-reduce that averages the gradients.
+    """
+    if jax.process_count() > 1:
+        raise NotImplementedError("multi-host training needs per-host data loading")
+    return jax.make_mesh((jax.device_count(),), ("data",), axis_types=(AxisType.Auto,))
+
+
+def check_batch_layout(config: default.Config, num_devices: int) -> None:
+    """Each step's batch must split evenly into microbatches, and those across devices."""
+    if config.grad_accum_steps < 1 or config.batch_size % config.grad_accum_steps:
+        raise ValueError(
+            f"batch_size ({config.batch_size}) must be a positive multiple of "
+            f"grad_accum_steps ({config.grad_accum_steps})"
+        )
+    if config.microbatch_size % num_devices:
+        raise ValueError(
+            f"batch_size / grad_accum_steps ({config.microbatch_size}) must be a "
+            f"multiple of the number of devices ({num_devices})"
+        )
 
 
 def weight_decay_mask(params: nnx.State) -> nnx.State:
@@ -119,7 +170,9 @@ def check_token_budget(data: TokenData, config: default.Config) -> None:
             f"{config.batch_size}x{config.sequence_length} tokens, the train data has "
             f"{available}. Lower n_iterations or add data (e.g. fineweb_train_shards)."
         )
-    eval_batches(data.val, config.val_tokens, config.batch_size, config.sequence_length)
+    eval_batches(
+        data.val, config.val_tokens, config.microbatch_size, config.sequence_length
+    )
 
 
 def open_checkpoints(workdir: str, config: default.Config) -> ocp.CheckpointManager:
@@ -208,11 +261,16 @@ def load_model(workdir: str) -> Mamba:
         )
         # Every weight gets overwritten, so skip the random init.
         model = nnx.eval_shape(lambda: Mamba.from_config(config, rngs=nnx.Rngs(0)))
+        # Place the weights on this machine's devices, not the ones the run was
+        # saved from (e.g. trained on 8 TPU chips, loaded on a laptop).
+        replicated = NamedSharding(make_mesh(), P())
+        target = jax.tree.map(
+            lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=replicated),
+            nnx.state(model, nnx.Param),
+        )
         restored = checkpoints.restore(
             step,
-            args=ocp.args.Composite(
-                model=ocp.args.StandardRestore(nnx.state(model, nnx.Param))
-            ),
+            args=ocp.args.Composite(model=ocp.args.StandardRestore(target)),
         )
     nnx.update(model, restored["model"])
     return model
@@ -236,6 +294,11 @@ def train_and_evaluate(config: default.Config, workdir: str) -> dict[str, list[f
     where its last checkpoint left off.
     """
     workdir = os.path.abspath(workdir)
+    mesh = make_mesh()
+    check_batch_layout(config, mesh.size)
+    replicated = NamedSharding(mesh, P())
+    batch_sharding = NamedSharding(mesh, P("data"))
+    microbatch_sharding = NamedSharding(mesh, P(None, "data"))
 
     if config.use_wandb:
         import wandb
@@ -258,9 +321,12 @@ def train_and_evaluate(config: default.Config, workdir: str) -> dict[str, list[f
 
     config = dataclasses.replace(config, vocab_size=data.vocab_size)
     model = Mamba.from_config(config, rngs=nnx.Rngs(config.seed))
+    nnx.update(model, jax.device_put(nnx.state(model), replicated))
+    # Optimizer state is created like the params, so it is replicated too.
     optimizer = make_optimizer(model, config)
 
     logging.info(f"Total number of parameters: {model.num_params:_}")
+    logging.info(f"Data parallel over {mesh.size} {jax.default_backend()} devices")
     if config.use_wandb:
         wandb.summary["num_params"] = model.num_params
 
@@ -279,7 +345,13 @@ def train_and_evaluate(config: default.Config, workdir: str) -> dict[str, list[f
         )
         remaining = itertools.islice(batches, config.n_iterations - first_step)
         for step, batch in enumerate(remaining, start=first_step + 1):
-            train_step(model, optimizer, metrics, jax.device_put(batch))
+            microbatches = split_microbatches(batch, config.grad_accum_steps)
+            train_step(
+                model,
+                optimizer,
+                metrics,
+                jax.device_put(microbatches, microbatch_sharding),
+            )
 
             logs = {}
             if step % config.n_freq_train == 0:
@@ -287,7 +359,7 @@ def train_and_evaluate(config: default.Config, workdir: str) -> dict[str, list[f
                 metrics.reset()
             if step % config.n_freq_eval == 0:
                 model.eval()
-                logs["val_loss"] = evaluate(model, data.val, config)
+                logs["val_loss"] = evaluate(model, data.val, config, batch_sharding)
                 model.train()
 
             for name, value in logs.items():

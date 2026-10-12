@@ -33,6 +33,20 @@ python main.py --workdir=artifacts/ \
     --config.val_tokens=10485760
 ```
 
+Training is data parallel over every local device (e.g. the 8 chips of a TPU v5e-8):
+params are replicated and each batch is split across devices. On accelerators, run the
+matmuls in bfloat16 (params, the residual stream, the scan and the loss stay float32), and
+split big batches into microbatches with `grad_accum_steps` to cap activation memory
+
+```shell
+python main.py --workdir=artifacts/ \
+    --config.dataset=fineweb \
+    --config.compute_dtype=bfloat16 \
+    --config.batch_size=512 \
+    --config.grad_accum_steps=8 \
+    --config.sequence_length=1024
+```
+
 Runs checkpoint to `<workdir>/checkpoints` every `n_freq_checkpoint` steps and at the end.
 Rerunning the same command resumes from the latest checkpoint, picking up the data
 stream and the learning rate schedule exactly where it left off, so a run can span

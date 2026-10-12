@@ -33,6 +33,7 @@ from input_pipeline import (
     num_train_batches,
     parse_fineweb_header,
     read_fineweb_shard,
+    split_microbatches,
     train_batches,
 )
 
@@ -79,6 +80,17 @@ def test_train_batches_from_a_first_batch_continue_the_full_pass(lengths: list[i
         for (x, y), (x_full, y_full) in zip(resumed, full[first_batch:]):
             np.testing.assert_array_equal(x, x_full)
             np.testing.assert_array_equal(y, y_full)
+
+
+@pytest.mark.parametrize("num_microbatches", [1, 2, 4])
+def test_split_microbatches_keeps_rows_in_order(num_microbatches: int):
+    (batch,) = train_batches(consecutive_shards([4 * 3 + 1]), 4, 3)
+
+    inputs, targets = split_microbatches(batch, num_microbatches)
+
+    assert inputs.shape == targets.shape == (num_microbatches, 4 // num_microbatches, 3)
+    np.testing.assert_array_equal(inputs.reshape(4, 3), batch[0])
+    np.testing.assert_array_equal(targets.reshape(4, 3), batch[1])
 
 
 def test_train_batches_shapes_and_dtype():
