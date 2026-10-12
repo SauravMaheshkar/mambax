@@ -16,7 +16,7 @@ class Config:
     batch_size: int = 16
     # learning rate
     learning_rate: float = 1e-3
-    # random seed
+    # random seed for model initialization
     seed: int = 42
     # number of iterations
     n_iterations: int = 10_000
