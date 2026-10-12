@@ -45,6 +45,10 @@ python main.py --workdir=artifacts/ \
     --config.scan_chunk_size=256
 ```
 
+Pretrained `transformers`-format checkpoints load strictly with
+`Mamba.from_pretrained`, e.g. `state-spaces/mamba-130m-hf` (Mamba-1) or
+`AntonV/mamba2-130m-hf` (Mamba-2).
+
 Training is data parallel over every local device (e.g. the 8 chips of a TPU v5e-8):
 params are replicated and each batch is split across devices. On accelerators, run the
 matmuls in bfloat16 (params, the residual stream, the scan and the loss stay float32), and

@@ -14,6 +14,10 @@ from model import Mamba, Mamba2Block, MambaBlock, dt_bias_init
 
 
 PRETRAINED_REPO = "state-spaces/mamba-130m-hf"
+# state-spaces/mamba2-130m converted to the `transformers` layout (the original is
+# a pickled torch checkpoint), by the author of transformers' Mamba2 port.
+PRETRAINED_MAMBA2_REPO = "AntonV/mamba2-130m-hf"
+PRETRAINED_MAMBA2_REVISION = "05e8773fc4ac1cd067e8a18a5c45372ce5178405"
 
 
 @pytest.fixture(scope="module")
@@ -40,6 +44,13 @@ def tiny_mamba2() -> Mamba:
 @pytest.fixture(scope="module")
 def pretrained_model() -> Mamba:
     return Mamba.from_pretrained(PRETRAINED_REPO)
+
+
+@pytest.fixture(scope="module")
+def pretrained_mamba2() -> Mamba:
+    return Mamba.from_pretrained(
+        PRETRAINED_MAMBA2_REPO, revision=PRETRAINED_MAMBA2_REVISION
+    )
 
 
 def sequential_scan(u, delta, A, B, C, D) -> np.ndarray:
@@ -415,3 +426,34 @@ def test_mamba2_bf16_keeps_ssd_in_float32_and_stays_close(tiny_mamba2: Mamba):
     error = np.abs(np.asarray(bf16(tokens)) - np.asarray(tiny_mamba2(tokens)))
     assert error.mean() < 0.02
     assert error.max() < 0.2
+
+
+def test_pretrained_mamba2_loads_every_checkpoint_tensor(pretrained_mamba2: Mamba):
+    path = hf_hub_download(
+        PRETRAINED_MAMBA2_REPO,
+        "model.safetensors",
+        revision=PRETRAINED_MAMBA2_REVISION,
+    )
+    with safe_open(path, framework="numpy") as f:
+        checkpoint_size = sum(f.get_tensor(key).size for key in f.keys())
+        in_proj = f.get_tensor("backbone.layers.3.mixer.in_proj.weight")
+        A_log = f.get_tensor("backbone.layers.3.mixer.A_log")
+
+    mixer = pretrained_mamba2.layers[3].mixer
+    assert isinstance(mixer, Mamba2Block)
+    assert pretrained_mamba2.num_params == checkpoint_size
+    np.testing.assert_array_equal(mixer.in_proj.kernel[...], in_proj.T)
+    np.testing.assert_array_equal(mixer.A_log[...], A_log)
+
+
+def test_pretrained_mamba2_copies_in_context(pretrained_mamba2: Mamba):
+    """The same induction check as Mamba-1: only a correct block (SSD, conv over
+    x B C, gated norm, head layout) loaded with the right weights passes."""
+    half = 32
+    tokens = jax.random.randint(jax.random.key(0), (4, half), 1000, 20000)
+    sequence = jnp.concatenate([tokens, tokens], axis=1)
+
+    predictions = jnp.argmax(pretrained_mamba2(sequence), axis=-1)
+    accuracy = (predictions[:, half:-1] == sequence[:, half + 1 :]).mean()
+
+    assert accuracy > 0.8

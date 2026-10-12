@@ -1,4 +1,6 @@
+import dataclasses
 import json
+import math
 
 import jax
 import jax.numpy as jnp
@@ -615,18 +617,7 @@ class Mamba(nnx.Module):
         with open(download("config.json")) as f:
             hf_config = json.load(f)
 
-        config = Config(
-            vocab_size=hf_config["vocab_size"],
-            model_dim=hf_config["hidden_size"],
-            num_layers=hf_config["num_hidden_layers"],
-            state_dim=hf_config["state_size"],
-            expand=hf_config["expand"],
-            conv_dim=hf_config["conv_kernel"],
-            dt_rank=hf_config["time_step_rank"],
-            use_bias=hf_config["use_bias"],
-            conv_bias=hf_config["use_conv_bias"],
-            norm_eps=hf_config["layer_norm_epsilon"],
-        )
+        config = _config_from_hf(hf_config)
 
         # Every weight gets overwritten, so skip the random init.
         model = nnx.eval_shape(lambda: cls.from_config(config, rngs=nnx.Rngs(0)))
@@ -652,6 +643,45 @@ class Mamba(nnx.Module):
 
         nnx.update(model, nnx.State.from_flat_path(loaded))
         return model
+
+
+def _config_from_hf(hf_config: dict) -> Config:
+    """Our config for a `transformers` Mamba or Mamba2 config.json."""
+    shared = Config(
+        vocab_size=hf_config["vocab_size"],
+        model_dim=hf_config["hidden_size"],
+        num_layers=hf_config["num_hidden_layers"],
+        state_dim=hf_config["state_size"],
+        expand=hf_config["expand"],
+        conv_dim=hf_config["conv_kernel"],
+        use_bias=hf_config["use_bias"],
+        conv_bias=hf_config["use_conv_bias"],
+        norm_eps=hf_config["layer_norm_epsilon"],
+    )
+    match hf_config["model_type"]:
+        case "mamba":
+            return dataclasses.replace(shared, dt_rank=hf_config["time_step_rank"])
+        case "mamba2":
+            # We don't clamp Δ, so refuse checkpoints trained with a clamp.
+            if hf_config.get("time_step_limit", [0.0, math.inf]) != [0.0, math.inf]:
+                raise NotImplementedError(
+                    f"time_step_limit {hf_config['time_step_limit']} is not supported"
+                )
+            config = dataclasses.replace(
+                shared,
+                block=Block.MAMBA2,
+                head_dim=hf_config["head_dim"],
+                num_groups=hf_config["n_groups"],
+                scan_chunk_size=hf_config["chunk_size"],
+            )
+            if config.hidden_dim // config.head_dim != hf_config["num_heads"]:
+                raise ValueError(
+                    f"num_heads {hf_config['num_heads']} != "
+                    f"hidden_dim {config.hidden_dim} / head_dim {config.head_dim}"
+                )
+            return config
+        case model_type:
+            raise ValueError(f"unsupported model_type {model_type!r}")
 
 
 def _hf_to_nnx(key: str, tensor: Array) -> tuple[PathParts, Array]:
