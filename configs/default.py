@@ -1,5 +1,11 @@
 import dataclasses
+import enum
 import math
+
+
+class Dataset(enum.StrEnum):
+    TINYSTORIES = "tinystories"
+    FINEWEB = "fineweb"
 
 
 # Field types stick to what ml_collections can parse from the command line:
@@ -24,11 +30,16 @@ class Config:
     n_freq_train: int = 100
     # frequency of evaluating the val loss
     n_freq_eval: int = 1000
-    # val tokens per evaluation, fixed so val losses stay comparable
+    # val tokens per evaluation, fixed so val losses stay comparable (the FineWeb
+    # speedrun uses input_pipeline.FINEWEB_SPEEDRUN_VAL_TOKENS = 10_485_760)
     val_tokens: int = 65_536
+    # dataset to train on
+    dataset: Dataset = Dataset.TINYSTORIES
     # TinyStories splits, `datasets` slicing like "train[:10%]" works
     train_split: str = "train"
     eval_split: str = "validation"
+    # FineWeb train shards to stream, 100M tokens (200MB) each
+    fineweb_train_shards: int = 1
     # sequence length for training
     sequence_length: int = 64
     # convolution dimension

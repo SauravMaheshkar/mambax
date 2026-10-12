@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from configs.default import Config
-from input_pipeline import VOCAB_SIZE
+from input_pipeline import TINYSTORIES_VOCAB_SIZE
 from train import train_and_evaluate
 
 
@@ -39,7 +39,7 @@ def test_logs_at_configured_frequencies(run):
 
 def test_learns_beyond_uniform_guessing(run):
     history, _ = run
-    uniform = math.log(VOCAB_SIZE)
+    uniform = math.log(TINYSTORIES_VOCAB_SIZE)
     assert history["train_loss"][-1] < history["train_loss"][0] < uniform
     assert history["val_loss"][-1] < 0.75 * uniform
 

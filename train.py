@@ -64,13 +64,13 @@ def check_token_budget(data: TokenData, config: default.Config) -> None:
         raise ValueError(
             f"n_iterations={config.n_iterations} needs {config.n_iterations} batches of "
             f"{config.batch_size}x{config.sequence_length} tokens, the train data has "
-            f"{available}. Lower n_iterations or train on a bigger train_split."
+            f"{available}. Lower n_iterations or add data (e.g. fineweb_train_shards)."
         )
     eval_batches(data.val, config.val_tokens, config.batch_size, config.sequence_length)
 
 
 def train_and_evaluate(config: default.Config, workdir: str) -> dict[str, list[float]]:
-    """Trains on `config.train_split` and returns the logged train and val losses."""
+    """Trains on `config.dataset` and returns the logged train and val losses."""
     workdir = os.path.abspath(workdir)
 
     if config.use_wandb:
@@ -82,7 +82,12 @@ def train_and_evaluate(config: default.Config, workdir: str) -> dict[str, list[f
             config=dataclasses.asdict(config),
         )
 
-    data = load_data(train_split=config.train_split, eval_split=config.eval_split)
+    data = load_data(
+        config.dataset,
+        tinystories_train_split=config.train_split,
+        tinystories_eval_split=config.eval_split,
+        fineweb_train_shards=config.fineweb_train_shards,
+    )
     check_token_budget(data, config)
     num_train_tokens = sum(len(shard) for shard in data.train)
     logging.info(f"Train tokens: {num_train_tokens:_}, val: {len(data.val):_}")

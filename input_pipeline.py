@@ -1,25 +1,35 @@
-"""Character-level TinyStories as a token stream, and batching over it.
+"""Datasets as token streams, and batching over them.
 
-A dataset reduces to token streams (1-D integer arrays, memmaps on disk): one
-or more train shards and a single val stream. Training reads the train shards
-as one contiguous stream, each token exactly once, the way the modded-nanogpt
-speedrun does. Evaluation always covers the same val prefix, so val losses are
-comparable across runs and checkpoints.
+Every dataset reduces to token streams (1-D integer arrays, memmaps on disk):
+one or more train shards and a single val stream. Training reads the train
+shards as one contiguous stream, each token exactly once, the way the
+modded-nanogpt speedrun does. Evaluation always covers the same val prefix, so
+val losses are comparable across runs and checkpoints.
 
     shard 0             shard 1
     [t0 t1 ... t99]     [t100 ... ]          <- one logical stream
     |-- batch 0 --|-- batch 1 --|-- ...      <- B*L tokens each, +1 for targets
 
-Each TinyStories split is encoded once, streamed chunk by chunk into a uint8
-file in the `datasets` cache (the train split is ~1.9GB of characters, more
-than a laptop wants in RAM):
+Two datasets are supported:
 
-    parquet --(datasets, memory-mapped Arrow)--> chunks of stories
-            --encode--> append to <cache>/mambax/*.u8 --np.memmap--> stream
+- TinyStories, character level. Each split is encoded once, streamed chunk by
+  chunk into a uint8 file in the `datasets` cache (the train split is ~1.9GB
+  of characters, more than a laptop wants in RAM):
 
-The vocabulary is fixed (printable ASCII plus newline) instead of derived from
-the data: ~0.1% of TinyStories is non-ASCII, almost all of it mojibake like
-"â€™", which maps to UNK.
+      parquet --(datasets, memory-mapped Arrow)--> chunks of stories
+              --encode--> append to <cache>/mambax/*.u8 --np.memmap--> stream
+
+  The vocabulary is fixed (printable ASCII plus newline) instead of derived
+  from the data: ~0.1% of TinyStories is non-ASCII, almost all of it mojibake
+  like "â€™", which maps to UNK.
+
+- FineWeb, GPT-2 tokenized, as used by the modded-nanogpt speedrun. Each
+  `.bin` shard holds 100M tokens: a 256 x int32 little-endian header (magic,
+  version, token count, then zeros) followed by the tokens as uint16. Every
+  document starts with <|endoftext|>. Shards are memory-mapped straight from
+  the Hugging Face cache, nothing is copied or re-encoded. Speedrun
+  comparisons evaluate on the first `FINEWEB_SPEEDRUN_VAL_TOKENS` of the val
+  shard.
 """
 
 import dataclasses
@@ -31,7 +41,10 @@ from pathlib import Path
 import datasets
 import datasets.config
 import numpy as np
-from jaxtyping import Int, UInt8
+from huggingface_hub import hf_hub_download
+from jaxtyping import Int, UInt8, UInt16
+
+from configs.default import Dataset
 
 
 TokenStream = Int[np.ndarray, " tokens"]
@@ -45,12 +58,26 @@ class TokenData:
     vocab_size: int
 
 
-def load_data(*, train_split: str = "train", eval_split: str = "validation") -> TokenData:
-    return TokenData(
-        train=[load_split(train_split)],
-        val=load_split(eval_split),
-        vocab_size=VOCAB_SIZE,
-    )
+def load_data(
+    dataset: Dataset,
+    *,
+    tinystories_train_split: str = "train",
+    tinystories_eval_split: str = "validation",
+    fineweb_train_shards: int = 1,
+) -> TokenData:
+    match dataset:
+        case Dataset.TINYSTORIES:
+            return TokenData(
+                train=[load_tinystories(tinystories_train_split)],
+                val=load_tinystories(tinystories_eval_split),
+                vocab_size=TINYSTORIES_VOCAB_SIZE,
+            )
+        case Dataset.FINEWEB:
+            return TokenData(
+                train=load_fineweb_train(fineweb_train_shards),
+                val=load_fineweb_val(),
+                vocab_size=FINEWEB_VOCAB_SIZE,
+            )
 
 
 # Batching.
@@ -125,37 +152,39 @@ def _to_batch(window: np.ndarray, batch_size: int, sequence_length: int) -> Batc
 
 # TinyStories, character level.
 
-DATASET = "roneneldan/TinyStories"
+TINYSTORIES_REPO = "roneneldan/TinyStories"
 # Pinned so the encoded cache can never silently go stale against new data.
-REVISION = "f54c09fd23315a6f9c86f9dc80f725de7d8f9c64"
+TINYSTORIES_REVISION = "f54c09fd23315a6f9c86f9dc80f725de7d8f9c64"
 
-EOS = 0
-UNK = 1
+TINYSTORIES_EOS = 0
+TINYSTORIES_UNK = 1
 _CHARS = "\n" + "".join(chr(c) for c in range(32, 127))
-VOCAB_SIZE = 2 + len(_CHARS)
+TINYSTORIES_VOCAB_SIZE = 2 + len(_CHARS)
 
 # Joins stories before encoding, then maps to EOS. ASCII "end of text", not in the data.
 _STORY_SEPARATOR = "\x03"
 
-_ENCODE_TABLE = np.full(128, UNK, dtype=np.uint8)
-_ENCODE_TABLE[ord(_STORY_SEPARATOR)] = EOS
+_ENCODE_TABLE = np.full(128, TINYSTORIES_UNK, dtype=np.uint8)
+_ENCODE_TABLE[ord(_STORY_SEPARATOR)] = TINYSTORIES_EOS
 for _id, _char in enumerate(_CHARS, start=2):
     _ENCODE_TABLE[ord(_char)] = _id
 
-_DECODE = {EOS: "\n\n", UNK: "�"} | {i: c for i, c in enumerate(_CHARS, start=2)}
+_DECODE = {TINYSTORIES_EOS: "\n\n", TINYSTORIES_UNK: "�"} | {
+    i: c for i, c in enumerate(_CHARS, start=2)
+}
 
 
-def encode(text: str) -> UInt8[np.ndarray, " chars"]:
+def encode_chars(text: str) -> UInt8[np.ndarray, " chars"]:
     codepoints = np.frombuffer(text.encode("utf-32-le"), dtype=np.uint32)
     ascii_ids = _ENCODE_TABLE[np.minimum(codepoints, 127)]
-    return np.where(codepoints < 128, ascii_ids, UNK).astype(np.uint8)
+    return np.where(codepoints < 128, ascii_ids, TINYSTORIES_UNK).astype(np.uint8)
 
 
-def decode(ids: Int[np.ndarray, " chars"]) -> str:
+def decode_chars(ids: Int[np.ndarray, " chars"]) -> str:
     return "".join(_DECODE[int(i)] for i in ids)
 
 
-def load_split(
+def load_tinystories(
     split: str, cache_dir: Path | None = None, chunk_size: int = 10_000
 ) -> UInt8[np.memmap, " chars"]:
     """Read-only memmap of a split as one stream of stories, each followed by EOS.
@@ -166,24 +195,27 @@ def load_split(
     """
     if chunk_size < 1:
         raise ValueError(f"chunk_size must be positive, got {chunk_size}")
-    path = _cache_path(split, Path(cache_dir or datasets.config.HF_DATASETS_CACHE))
+    path = _tinystories_cache_path(
+        split, Path(cache_dir or datasets.config.HF_DATASETS_CACHE)
+    )
     if not path.exists():
-        _encode_to_file(split, path, chunk_size)
+        _encode_tinystories_to_file(split, path, chunk_size)
     return np.memmap(path, dtype=np.uint8, mode="r")
 
 
-def _cache_path(split: str, cache_dir: Path) -> Path:
+def _tinystories_cache_path(split: str, cache_dir: Path) -> Path:
     key = hashlib.sha256(
-        f"{DATASET}@{REVISION}:{split}".encode() + _ENCODE_TABLE.tobytes()
+        f"{TINYSTORIES_REPO}@{TINYSTORIES_REVISION}:{split}".encode()
+        + _ENCODE_TABLE.tobytes()
     ).hexdigest()[:16]
     return cache_dir / "mambax" / f"tinystories-{split.partition('[')[0]}-{key}.u8"
 
 
-def _encode_to_file(split: str, path: Path, chunk_size: int) -> None:
+def _encode_tinystories_to_file(split: str, path: Path, chunk_size: int) -> None:
     name = split.partition("[")[0]
     stories = datasets.load_dataset(
-        DATASET,
-        revision=REVISION,
+        TINYSTORIES_REPO,
+        revision=TINYSTORIES_REVISION,
         data_files={name: f"data/{name}-*.parquet"},
         split=split,
     )
@@ -196,7 +228,7 @@ def _encode_to_file(split: str, path: Path, chunk_size: int) -> None:
         with tmp.open("wb") as f:
             for batch in stories.iter(batch_size=chunk_size):
                 text = _STORY_SEPARATOR.join(batch["text"]) + _STORY_SEPARATOR
-                f.write(encode(text).tobytes())
+                f.write(encode_chars(text).tobytes())
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
@@ -218,3 +250,73 @@ def _is_running(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+# FineWeb, GPT-2 tokenized shards from the modded-nanogpt speedrun.
+
+FINEWEB_REPO = "kjj0/fineweb10B-gpt2"
+# Pinned so a re-upload can't silently change what "the val set" means.
+FINEWEB_REVISION = "889765ea1f903759787add96995d81171b632d0c"
+
+FINEWEB_VOCAB_SIZE = 50257
+FINEWEB_EOT = 50256
+FINEWEB_SPEEDRUN_VAL_TOKENS = 10_485_760
+FINEWEB_MAX_TRAIN_SHARDS = 103
+
+FINEWEB_MAGIC = 20240520
+FINEWEB_VERSION = 1
+FINEWEB_HEADER_BYTES = 256 * 4
+
+
+def parse_fineweb_header(header: bytes) -> int:
+    """Validates a shard header and returns how many tokens follow it."""
+    if len(header) < FINEWEB_HEADER_BYTES:
+        raise ValueError(
+            f"shard header is {len(header)} bytes, expected {FINEWEB_HEADER_BYTES}"
+        )
+    magic, version, num_tokens = np.frombuffer(header, dtype="<i4", count=3)
+    if magic != FINEWEB_MAGIC:
+        raise ValueError(f"not a FineWeb shard: magic {magic}, expected {FINEWEB_MAGIC}")
+    if version != FINEWEB_VERSION:
+        raise ValueError(
+            f"unsupported shard version {version}, expected {FINEWEB_VERSION}"
+        )
+    return int(num_tokens)
+
+
+def read_fineweb_shard(path: Path) -> UInt16[np.memmap, " tokens"]:
+    """Read-only memmap of a shard's tokens, after checking its header and size."""
+    with path.open("rb") as f:
+        num_tokens = parse_fineweb_header(f.read(FINEWEB_HEADER_BYTES))
+    expected_bytes = FINEWEB_HEADER_BYTES + 2 * num_tokens
+    if (actual := path.stat().st_size) != expected_bytes:
+        raise ValueError(
+            f"{path} is {actual} bytes but its header promises {expected_bytes}"
+        )
+    return np.memmap(
+        path, dtype="<u2", mode="r", offset=FINEWEB_HEADER_BYTES, shape=(num_tokens,)
+    )
+
+
+def load_fineweb_train(num_shards: int) -> list[UInt16[np.memmap, " tokens"]]:
+    """The first `num_shards` train shards (100M tokens, 200MB each), downloaded once."""
+    if not 1 <= num_shards <= FINEWEB_MAX_TRAIN_SHARDS:
+        raise ValueError(
+            f"num_shards must be in [1, {FINEWEB_MAX_TRAIN_SHARDS}], got {num_shards}"
+        )
+    return [
+        read_fineweb_shard(_download_fineweb(f"fineweb_train_{i:06d}.bin"))
+        for i in range(1, num_shards + 1)
+    ]
+
+
+def load_fineweb_val() -> UInt16[np.memmap, " tokens"]:
+    return read_fineweb_shard(_download_fineweb("fineweb_val_000000.bin"))
+
+
+def _download_fineweb(filename: str) -> Path:
+    return Path(
+        hf_hub_download(
+            FINEWEB_REPO, filename, repo_type="dataset", revision=FINEWEB_REVISION
+        )
+    )
