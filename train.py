@@ -1,4 +1,5 @@
 import dataclasses
+import itertools
 import os
 
 import jax
@@ -8,7 +9,14 @@ from absl import logging
 from flax import nnx
 
 from configs import default
-from input_pipeline import VOCAB_SIZE, load_split, sample_batch
+from input_pipeline import (
+    TokenData,
+    TokenStream,
+    eval_batches,
+    load_data,
+    num_train_batches,
+    train_batches,
+)
 from model import Mamba
 
 
@@ -41,19 +49,24 @@ def eval_step(model: Mamba, batch: Batch) -> jax.Array:
     return loss_fn(model, batch)[0]
 
 
-def evaluate(model: Mamba, data: np.ndarray, config: default.Config) -> float:
-    """Mean loss over `n_eval_batches` windows, identical on every call."""
-    rng = np.random.default_rng(config.seed)
-    losses = [
-        eval_step(
-            model,
-            jax.device_put(
-                sample_batch(rng, data, config.batch_size, config.sequence_length)
-            ),
+def evaluate(model: Mamba, val: TokenStream, config: default.Config) -> float:
+    """Mean loss over the first `config.val_tokens` val targets, identical every call."""
+    batches = eval_batches(
+        val, config.val_tokens, config.batch_size, config.sequence_length
+    )
+    return float(np.mean([eval_step(model, jax.device_put(batch)) for batch in batches]))
+
+
+def check_token_budget(data: TokenData, config: default.Config) -> None:
+    """Fails before training, not hours in, when the data can't cover the run."""
+    available = num_train_batches(data.train, config.batch_size, config.sequence_length)
+    if available < config.n_iterations:
+        raise ValueError(
+            f"n_iterations={config.n_iterations} needs {config.n_iterations} batches of "
+            f"{config.batch_size}x{config.sequence_length} tokens, the train data has "
+            f"{available}. Lower n_iterations or train on a bigger train_split."
         )
-        for _ in range(config.n_eval_batches)
-    ]
-    return float(np.mean(losses))
+    eval_batches(data.val, config.val_tokens, config.batch_size, config.sequence_length)
 
 
 def train_and_evaluate(config: default.Config, workdir: str) -> dict[str, list[float]]:
@@ -69,11 +82,12 @@ def train_and_evaluate(config: default.Config, workdir: str) -> dict[str, list[f
             config=dataclasses.asdict(config),
         )
 
-    train_data = load_split(config.train_split)
-    val_data = load_split(config.eval_split)
-    logging.info(f"Train characters: {len(train_data):_}, val: {len(val_data):_}")
+    data = load_data(train_split=config.train_split, eval_split=config.eval_split)
+    check_token_budget(data, config)
+    num_train_tokens = sum(len(shard) for shard in data.train)
+    logging.info(f"Train tokens: {num_train_tokens:_}, val: {len(data.val):_}")
 
-    config = dataclasses.replace(config, vocab_size=VOCAB_SIZE)
+    config = dataclasses.replace(config, vocab_size=data.vocab_size)
     model = Mamba.from_config(config, rngs=nnx.Rngs(config.seed))
 
     logging.info(f"Total number of parameters: {model.num_params:_}")
@@ -84,15 +98,12 @@ def train_and_evaluate(config: default.Config, workdir: str) -> dict[str, list[f
         model, optax.adamw(config.learning_rate, nesterov=True), wrt=nnx.Param
     )
     metrics = nnx.MultiMetric(loss=nnx.metrics.Average("loss"))
-    rng = np.random.default_rng(config.seed)
     history: dict[str, list[float]] = {"train_loss": [], "val_loss": []}
 
     model.train()
-    for step in range(1, config.n_iterations + 1):
-        batch = jax.device_put(
-            sample_batch(rng, train_data, config.batch_size, config.sequence_length)
-        )
-        train_step(model, optimizer, metrics, batch)
+    batches = train_batches(data.train, config.batch_size, config.sequence_length)
+    for step, batch in enumerate(itertools.islice(batches, config.n_iterations), start=1):
+        train_step(model, optimizer, metrics, jax.device_put(batch))
 
         logs = {}
         if step % config.n_freq_train == 0:
@@ -100,7 +111,7 @@ def train_and_evaluate(config: default.Config, workdir: str) -> dict[str, list[f
             metrics.reset()
         if step % config.n_freq_eval == 0:
             model.eval()
-            logs["val_loss"] = evaluate(model, val_data, config)
+            logs["val_loss"] = evaluate(model, data.val, config)
             model.train()
 
         for name, value in logs.items():

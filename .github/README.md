@@ -7,7 +7,8 @@ uv sync --all-groups
 ## Getting started
 
 Trains a character-level Mamba on [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories),
-logging train loss and validation loss.
+logging train loss and validation loss. Training streams through the data in order,
+each token once, and every evaluation covers the same `val_tokens` prefix of the val split.
 
 ```shell
 python main.py --workdir=artifacts/
