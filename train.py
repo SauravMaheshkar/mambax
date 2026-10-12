@@ -74,7 +74,7 @@ def train_and_evaluate(config: default.Config, workdir: str) -> dict[str, list[f
     logging.info(f"Train characters: {len(train_data):_}, val: {len(val_data):_}")
 
     config = dataclasses.replace(config, vocab_size=VOCAB_SIZE)
-    model = Mamba.from_config(config, rngs=nnx.Rngs(0))
+    model = Mamba.from_config(config, rngs=nnx.Rngs(config.seed))
 
     logging.info(f"Total number of parameters: {model.num_params:_}")
     if config.use_wandb:
