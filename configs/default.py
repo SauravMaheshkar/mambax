@@ -1,8 +1,9 @@
 import dataclasses
 import math
-from typing import Literal
 
 
+# Field types stick to what ml_collections can parse from the command line:
+# plain scalars, Optional scalars and enums (Literal and non-Optional unions fail).
 @dataclasses.dataclass
 class Config:
     # vocab size
@@ -32,8 +33,8 @@ class Config:
     sequence_length: int = 64
     # convolution dimension
     conv_dim: int = 4
-    # dt rank
-    dt_rank: int | Literal["auto"] = "auto"
+    # dt rank, None for Mamba's default of ceil(model_dim / 16)
+    dt_rank: int | None = None
     # state dimension
     state_dim: int = 16
     # expand factor
@@ -64,7 +65,7 @@ class Config:
 
     @property
     def resolved_dt_rank(self) -> int:
-        if self.dt_rank == "auto":
+        if self.dt_rank is None:
             return math.ceil(self.model_dim / 16)
         return self.dt_rank
 

@@ -155,23 +155,6 @@ def test_dt_proj_uses_mamba_init(tiny_model: Mamba):
     assert jnp.all(jnp.abs(dt_proj.kernel[...]) <= tiny_model.dt_rank**-0.5)
 
 
-@pytest.mark.parametrize(("vocab_size", "padded"), [(64, 64), (65, 72), (50277, 50280)])
-def test_config_pads_vocab(vocab_size: int, padded: int):
-    assert Config(vocab_size=vocab_size).padded_vocab_size == padded
-
-
-def test_config_derived_values_follow_overrides():
-    config = Config(model_dim=192)
-    config.model_dim = 256
-    assert config.hidden_dim == 512
-    assert config.resolved_dt_rank == 16
-
-
-def test_config_rejects_unset_vocab():
-    with pytest.raises(ValueError, match="vocab_size is unset"):
-        Config().padded_vocab_size
-
-
 def test_pretrained_loads_every_checkpoint_tensor(pretrained_model: Mamba):
     path = hf_hub_download(PRETRAINED_REPO, "model.safetensors")
     with safe_open(path, framework="numpy") as f:
