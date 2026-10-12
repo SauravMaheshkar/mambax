@@ -1,20 +1,31 @@
-"""Character-level TinyStories.
+"""Character-level TinyStories as a token stream, and batching over it.
 
-The train split is ~1.9GB of characters, more than a laptop wants in RAM.
-Each split is encoded once, streamed chunk by chunk into a uint8 file in the
-`datasets` cache, and read back as an `np.memmap`, so training only pages in
-the windows it samples:
+A dataset reduces to token streams (1-D integer arrays, memmaps on disk): one
+or more train shards and a single val stream. Training reads the train shards
+as one contiguous stream, each token exactly once, the way the modded-nanogpt
+speedrun does. Evaluation always covers the same val prefix, so val losses are
+comparable across runs and checkpoints.
+
+    shard 0             shard 1
+    [t0 t1 ... t99]     [t100 ... ]          <- one logical stream
+    |-- batch 0 --|-- batch 1 --|-- ...      <- B*L tokens each, +1 for targets
+
+Each TinyStories split is encoded once, streamed chunk by chunk into a uint8
+file in the `datasets` cache (the train split is ~1.9GB of characters, more
+than a laptop wants in RAM):
 
     parquet --(datasets, memory-mapped Arrow)--> chunks of stories
-            --encode--> append to <cache>/mambax/*.u8 --np.memmap--> sample_batch
+            --encode--> append to <cache>/mambax/*.u8 --np.memmap--> stream
 
 The vocabulary is fixed (printable ASCII plus newline) instead of derived from
 the data: ~0.1% of TinyStories is non-ASCII, almost all of it mojibake like
 "â€™", which maps to UNK.
 """
 
+import dataclasses
 import hashlib
 import os
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import datasets
@@ -22,6 +33,97 @@ import datasets.config
 import numpy as np
 from jaxtyping import Int, UInt8
 
+
+TokenStream = Int[np.ndarray, " tokens"]
+Batch = tuple[Int[np.ndarray, "batch seq"], Int[np.ndarray, "batch seq"]]
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenData:
+    train: Sequence[TokenStream]
+    val: TokenStream
+    vocab_size: int
+
+
+def load_data(*, train_split: str = "train", eval_split: str = "validation") -> TokenData:
+    return TokenData(
+        train=[load_split(train_split)],
+        val=load_split(eval_split),
+        vocab_size=VOCAB_SIZE,
+    )
+
+
+# Batching.
+
+
+def num_train_batches(
+    shards: Sequence[TokenStream], batch_size: int, sequence_length: int
+) -> int:
+    total = sum(len(shard) for shard in shards)
+    return max(total - 1, 0) // (batch_size * sequence_length)
+
+
+def train_batches(
+    shards: Sequence[TokenStream], batch_size: int, sequence_length: int
+) -> Iterator[Batch]:
+    """Consecutive batches over the shards read as one stream, until it runs out.
+
+    Batch k covers stream tokens [k*B*L, (k+1)*B*L], the extra token being the
+    last target. Rows are consecutive L-token windows, so no token is skipped
+    or repeated, including across shard boundaries.
+    """
+    offsets = np.cumsum([0, *(len(shard) for shard in shards)])
+    step = batch_size * sequence_length
+    for start in range(0, int(offsets[-1]) - step, step):
+        window = _read(shards, offsets, start, start + step + 1)
+        yield _to_batch(window, batch_size, sequence_length)
+
+
+def eval_batches(
+    val: TokenStream, val_tokens: int, batch_size: int, sequence_length: int
+) -> Iterator[Batch]:
+    """Batches covering exactly the first `val_tokens` targets of `val`, in order."""
+    step = batch_size * sequence_length
+    if val_tokens <= 0 or val_tokens % step:
+        raise ValueError(
+            f"val_tokens ({val_tokens}) must be a positive multiple of "
+            f"batch_size * sequence_length ({step})"
+        )
+    if val_tokens + 1 > len(val):
+        raise ValueError(
+            f"val_tokens ({val_tokens}) needs {val_tokens + 1} val tokens, "
+            f"the val stream has {len(val)}"
+        )
+    return (
+        _to_batch(val[start : start + step + 1], batch_size, sequence_length)
+        for start in range(0, val_tokens, step)
+    )
+
+
+def _read(
+    shards: Sequence[TokenStream], offsets: np.ndarray, start: int, stop: int
+) -> np.ndarray:
+    """Stream tokens [start, stop), stitched across shard boundaries."""
+    parts = []
+    shard = int(np.searchsorted(offsets, start, side="right")) - 1
+    while start < stop:
+        local = start - int(offsets[shard])
+        take = min(stop, int(offsets[shard + 1])) - start
+        parts.append(shards[shard][local : local + take])
+        start += take
+        shard += 1
+    return np.concatenate(parts)
+
+
+def _to_batch(window: np.ndarray, batch_size: int, sequence_length: int) -> Batch:
+    tokens = np.asarray(window, dtype=np.int32)
+    return (
+        tokens[:-1].reshape(batch_size, sequence_length),
+        tokens[1:].reshape(batch_size, sequence_length),
+    )
+
+
+# TinyStories, character level.
 
 DATASET = "roneneldan/TinyStories"
 # Pinned so the encoded cache can never silently go stale against new data.
@@ -116,15 +218,3 @@ def _is_running(pid: int) -> bool:
     except PermissionError:
         return True
     return True
-
-
-def sample_batch(
-    rng: np.random.Generator,
-    data: UInt8[np.ndarray, " chars"],
-    batch_size: int,
-    sequence_length: int,
-) -> tuple[Int[np.ndarray, "batch seq"], Int[np.ndarray, "batch seq"]]:
-    """Random windows of `data` as (inputs, next-character targets)."""
-    starts = rng.integers(0, len(data) - sequence_length, size=batch_size)
-    windows = data[starts[:, None] + np.arange(sequence_length + 1)].astype(np.int32)
-    return windows[:, :-1], windows[:, 1:]

@@ -17,10 +17,97 @@ from input_pipeline import (
     VOCAB_SIZE,
     decode,
     encode,
+    eval_batches,
     load_split,
-    sample_batch,
+    num_train_batches,
+    train_batches,
 )
 
+
+def consecutive_shards(lengths: list[int]) -> list[np.ndarray]:
+    """Shards holding 0, 1, 2, ... so a correct stream always has target = input + 1."""
+    bounds = np.cumsum([0, *lengths])
+    return [
+        np.arange(start, stop, dtype=np.uint16) for start, stop in zip(bounds, bounds[1:])
+    ]
+
+
+SHARD_LAYOUTS = {
+    "single shard": [40],
+    "ragged shards": [10, 15, 15],
+    "boundary on a batch edge": [12, 12, 16],
+    "empty shard in the middle": [10, 0, 30],
+    "one-token shards": [1] * 40,
+}
+
+
+@pytest.mark.parametrize("lengths", SHARD_LAYOUTS.values(), ids=SHARD_LAYOUTS.keys())
+@pytest.mark.parametrize(("batch_size", "sequence_length"), [(1, 1), (2, 3), (3, 4)])
+def test_train_batches_read_every_token_once_in_order(
+    lengths: list[int], batch_size: int, sequence_length: int
+):
+    shards = consecutive_shards(lengths)
+    batches = list(train_batches(shards, batch_size, sequence_length))
+
+    assert len(batches) == num_train_batches(shards, batch_size, sequence_length)
+    inputs = np.concatenate([x.ravel() for x, _ in batches])
+    targets = np.concatenate([y.ravel() for _, y in batches])
+    np.testing.assert_array_equal(inputs, np.arange(len(inputs)))
+    np.testing.assert_array_equal(targets, inputs + 1)
+
+
+def test_train_batches_shapes_and_dtype():
+    for inputs, targets in train_batches(consecutive_shards([10, 15, 15]), 2, 3):
+        assert inputs.shape == targets.shape == (2, 3)
+        assert inputs.dtype == targets.dtype == np.int32
+
+
+@pytest.mark.parametrize(
+    ("total", "expected"), [(0, 0), (6, 0), (7, 1), (12, 1), (13, 2), (40, 6)]
+)
+def test_num_train_batches_leaves_room_for_the_last_target(total: int, expected: int):
+    assert num_train_batches(consecutive_shards([total]), 2, 3) == expected
+
+
+def test_eval_batches_cover_exactly_the_val_prefix():
+    val = np.arange(100, dtype=np.uint16)
+    batches = list(eval_batches(val, val_tokens=24, batch_size=2, sequence_length=3))
+
+    assert len(batches) == 4
+    inputs = np.concatenate([x.ravel() for x, _ in batches])
+    targets = np.concatenate([y.ravel() for _, y in batches])
+    np.testing.assert_array_equal(inputs, np.arange(24))
+    np.testing.assert_array_equal(targets, np.arange(1, 25))
+
+
+def test_eval_batches_are_identical_on_every_call():
+    val = np.arange(100, dtype=np.uint16)
+    first = list(eval_batches(val, 24, 2, 3))
+    second = list(eval_batches(val, 24, 2, 3))
+    np.testing.assert_array_equal(first, second)
+
+
+def test_eval_batches_accept_the_whole_stream_minus_the_last_target():
+    val = np.arange(25, dtype=np.uint16)
+    assert len(list(eval_batches(val, 24, 2, 3))) == 4
+
+
+@pytest.mark.parametrize(
+    ("val_tokens", "match"),
+    [
+        (0, "positive multiple"),
+        (-6, "positive multiple"),
+        (7, "positive multiple"),
+        (24, "the val stream has 24"),
+    ],
+)
+def test_eval_batches_reject_bad_budgets_before_iterating(val_tokens: int, match: str):
+    val = np.arange(24, dtype=np.uint16)
+    with pytest.raises(ValueError, match=match):
+        eval_batches(val, val_tokens, batch_size=2, sequence_length=3)
+
+
+# TinyStories.
 
 VALIDATION_SLICE = "validation[:1%]"
 
@@ -164,31 +251,3 @@ def test_temp_files_of_live_encoders_are_kept(tmp_path: Path):
     load_split("validation[:10]", cache_dir=tmp_path)
 
     assert live.exists()
-
-
-@pytest.mark.parametrize(("batch_size", "sequence_length"), [(1, 1), (4, 16), (8, 64)])
-def test_sample_batch_targets_are_inputs_shifted_by_one(
-    validation_ids: np.ndarray, batch_size: int, sequence_length: int
-):
-    rng = np.random.default_rng(0)
-    inputs, targets = sample_batch(rng, validation_ids, batch_size, sequence_length)
-
-    assert inputs.shape == targets.shape == (batch_size, sequence_length)
-    assert inputs.dtype == targets.dtype == np.int32
-    np.testing.assert_array_equal(inputs[:, 1:], targets[:, :-1])
-    for row_inputs, row_targets in zip(inputs, targets):
-        window = np.concatenate([row_inputs, row_targets[-1:]])
-        start = _find_window(validation_ids, window)
-        assert start is not None
-
-
-def test_sample_batch_is_deterministic_per_seed(validation_ids: np.ndarray):
-    first = sample_batch(np.random.default_rng(3), validation_ids, 4, 32)
-    second = sample_batch(np.random.default_rng(3), validation_ids, 4, 32)
-    np.testing.assert_array_equal(first, second)
-
-
-def _find_window(data: np.ndarray, window: np.ndarray) -> int | None:
-    windows = np.lib.stride_tricks.sliding_window_view(data, len(window))
-    matches = np.flatnonzero((windows == window).all(axis=1))
-    return int(matches[0]) if len(matches) else None

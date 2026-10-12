@@ -24,8 +24,8 @@ class Config:
     n_freq_train: int = 100
     # frequency of evaluating the val loss
     n_freq_eval: int = 1000
-    # number of batches per val loss evaluation
-    n_eval_batches: int = 20
+    # val tokens per evaluation, fixed so val losses stay comparable
+    val_tokens: int = 65_536
     # TinyStories splits, `datasets` slicing like "train[:10%]" works
     train_split: str = "train"
     eval_split: str = "validation"
