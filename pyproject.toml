@@ -20,7 +20,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=6.0.0",
-    "ruff>=0.16.0",
+    "ruff>=0.17.1",
     "ty>=0.0.85",
 ]
 wandb = [
