@@ -8,6 +8,7 @@ from einops import einsum, rearrange, repeat
 from flax import nnx
 from flax.typing import PathParts
 from huggingface_hub import hf_hub_download
+from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int
 from safetensors import safe_open
 
@@ -73,7 +74,7 @@ class MambaBlock(nnx.Module):
         use_bias: bool = False,
         conv_bias: bool = True,
         scan_chunk_size: int = 32,
-        dtype: jnp.dtype = jnp.float32,
+        dtype: DTypeLike = jnp.float32,
         rngs: nnx.Rngs,
     ):
         super().__init__()
@@ -247,7 +248,9 @@ def _segment_sums(a: Float[Array, "... chunk"]) -> Float[Array, "... chunk chunk
 class GatedRMSNorm(nnx.Module):
     """RMSNorm(y * silu(z)) per group of channels, Mamba-2's norm before out_proj."""
 
-    def __init__(self, num_features: int, *, num_groups: int, epsilon: float, dtype):
+    def __init__(
+        self, num_features: int, *, num_groups: int, epsilon: float, dtype: DTypeLike
+    ):
         self.num_groups = num_groups
         self.epsilon = epsilon
         self.dtype = dtype
@@ -289,7 +292,7 @@ class Mamba2Block(nnx.Module):
         conv_bias: bool = True,
         norm_eps: float = 1e-5,
         scan_chunk_size: int = 256,
-        dtype: jnp.dtype = jnp.float32,
+        dtype: DTypeLike = jnp.float32,
         rngs: nnx.Rngs,
     ):
         super().__init__()
@@ -454,7 +457,7 @@ class ResidualBlock(nnx.Module):
         *,
         model_dim: int,
         norm_eps: float = 1e-5,
-        dtype: jnp.dtype = jnp.float32,
+        dtype: DTypeLike = jnp.float32,
         rngs: nnx.Rngs,
     ):
         super().__init__()
@@ -488,7 +491,7 @@ class Mamba(nnx.Module):
         conv_bias: bool = True,
         norm_eps: float = 1e-5,
         scan_chunk_size: int = 32,
-        dtype: jnp.dtype = jnp.float32,
+        dtype: DTypeLike = jnp.float32,
         rngs: nnx.Rngs,
     ):
         super().__init__()

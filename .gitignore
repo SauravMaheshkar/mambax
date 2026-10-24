@@ -12,5 +12,4 @@ data/
 models/
 notebooks/
 
-uv.lock
 **/.DS_Store
